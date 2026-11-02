@@ -169,3 +169,7 @@ CONFIRM_BTN = (1534, 947)
 MIT。见 [LICENSE](LICENSE)。
 
 游戏素材（`coc_templates/` 里的模板图）版权归 Supercell 所有，仅作为识别用的最小必要样本。
+
+## 社区
+
+本开源项目已链接并认可 [LINUX DO 社区](https://linux.do)。
