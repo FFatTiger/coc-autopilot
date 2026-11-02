@@ -1,0 +1,9 @@
+{
+  "schedule": ["09:00", "13:00", "18:00", "22:00"],
+  "collect": true,
+  "upgrade": true,
+  "upgrade_kinds": ["gold", "elixir"],
+  "max_price": 3000000,
+  "max_upgrades": 1,
+  "min_free_workers": 1
+}
