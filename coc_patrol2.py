@@ -9,7 +9,7 @@ import time
 import cv2
 import numpy as np
 
-SERIAL = os.environ.get("ANDROID_SERIAL", "").strip()   # 必填：adb devices 里的序列号
+SERIAL = os.environ.get("ANDROID_SERIAL", "").strip()
 PKG = "com.tencent.tmgp.supercell.clashofclans"
 ACT = "com.supercell.titan.tencent.GameAppTencent"
 OUT = "/tmp/probe"
@@ -58,26 +58,51 @@ def close_capture():
 
 
 def grab(tag=None):
-    """取一帧。优先 minicap（~80ms），不可用时 screencap（~1200ms）。"""
-    global _mc
-    if _mc:
+    """取一帧。优先 minicap（~80ms），失败先重连，连续失败才降级 screencap（~1200ms）。"""
+    global _mc, _mc_fail
+    if _mc is None and _mc_fail < 3:
         try:
-            img = _mc.grab()
-            if img is not None and img.shape[0] > img.shape[1]:
-                _mc.restart()          # 游戏已横屏但投影还是竖屏，重建一次
-                time.sleep(0.6)
-                img = _mc.grab()
-            if img is not None and img.size:
-                if SHOT_LOG and tag:
-                    cv2.imwrite(f"{OUT}/{tag}.png", img)
-                return img
+            from mc import Minicap
+            _mc = Minicap(connect=True)
+            _mc_fail = 0
         except Exception:
-            _mc = None                # 流断了就降级，不重连
+            _mc = None
+            _mc_fail += 1
+    if _mc is not None:
+        for attempt in range(2):
+            try:
+                img = _mc.grab()
+                if img is not None and img.shape[0] > img.shape[1]:
+                    _mc.restart()          # 横屏了但投影还是竖屏，重建一次
+                    time.sleep(0.6)
+                    img = _mc.grab()
+                if img is not None and img.size:
+                    _mc_fail = 0
+                    if SHOT_LOG and tag:
+                        cv2.imwrite(f"{OUT}/{tag}.png", img)
+                    return img
+                raise RuntimeError("空帧")
+            except Exception:
+                if attempt == 0:
+                    try:
+                        _mc.restart()
+                        time.sleep(0.8)
+                        continue
+                    except Exception:
+                        pass
+                try:
+                    _mc.close()
+                except Exception:
+                    pass
+                _mc = None
+                _mc_fail += 1
+                break
     p = f"{OUT}/{tag or '_cur'}.png"
     with open(p, "wb") as f:
         subprocess.run(["adb", "-s", SERIAL, "exec-out", "screencap", "-p"],
                        stdout=f, timeout=30)
-    return cv2.imread(p)
+    img = cv2.imread(p)
+    return img if img is not None and img.size else None
 
 
 def log(m):
@@ -141,6 +166,22 @@ def read_res(img):
         lo, hi = RES_RANGE[k]
         out[k] = v if (v is not None and lo <= v <= hi) else None
     return out
+
+
+def read_res_until(n=3, tries=4, gap=1.2):
+    """连拍投票，直到三项都读出来；用于有动画干扰的时机（收集后、升级后）。"""
+    best = None
+    for _ in range(tries):
+        r = read_res_vote(n)
+        if best is None:
+            best = r
+        for k in ("gold", "elixir", "dark"):
+            if best.get(k) is None and r.get(k) is not None:
+                best[k] = r[k]
+        if all(best.get(k) is not None for k in ("gold", "elixir")):
+            return best
+        time.sleep(gap)
+    return best
 
 
 def read_res_vote(n=3):
@@ -414,11 +455,14 @@ def zoom_to_min(cx=1110, cy=540, max_tries=14, tol=1.2):
 
 # ---------------- 村庄状态检查 ----------------
 STAR_BOX = (50, 798, 205, 866)      # 左下角 5 颗胜利之星
-WORKER_BOX = (1950, 780, 2075, 880)  # 只框「0/5」工人计数，右边「1/1」是宝石/圣水符，会带出假读数
+WORKER_BOX = (1950, 780, 2075, 880)  # 只框「空闲/总数」工人计数，右边「1/1」是宝石/圣水符
 
 
 def read_workers(img):
-    """返回 (在用, 总数)，读不到返回 (None, None)。白字压深色底，先用 HSV 滤底再放大 OCR。"""
+    """返回 (空闲, 总数)，读不到返回 (None, None)。
+
+    游戏右下角的「0/5」是「空闲工人/总工人」——0 表示全在忙，不是全空闲。
+    """
     x1, y1, x2, y2 = WORKER_BOX
     roi = img[y1:y2, x1:x2]
     if roi.size:
@@ -465,6 +509,8 @@ def deselect():
 
 
 def panel_ratio(img, box=(450, 640, 1850, 1080)):
+    if img is None or not getattr(img, "size", 0):
+        return 0.0
     """面板木纹黄色占比。实测：无面板 0.04-0.06，面板打开 0.13+。"""
     x1, y1, x2, y2 = box
     hsv = cv2.cvtColor(img[y1:y2, x1:x2], cv2.COLOR_BGR2HSV)
@@ -619,11 +665,13 @@ if __name__ == "__main__":
 BUILD_BTN = (2091, 918)        # 右下角锤子「建造」
 LIST_BOX = (1600, 50, 2220, 1010)
 LIST_ROW_X = 1900              # 列表行点击 x
-CONFIRM_BTN = (1534, 947)      # 确认弹窗绿色「确认」
+CONFIRM_BTN = (1497, 935)      # 确认弹窗绿色「确认」（文字 1497,906 / 价格 1467,959）
 
 
 def _list_has_price(im):
-    for t in ocr_all(im, (2050, 300, 2220, 1000)):
+    if im is None:
+        return False
+    for t in ocr_all(im, (1930, 300, 2220, 1010)):
         d = "".join(c for c in t["t"] if c.isdigit())
         if len(d) >= 4 and not any(u in t["t"] for u in ("天", "小时", "分钟")):
             return True
@@ -692,65 +740,169 @@ def read_build_list(im):
         n = min(cand, key=lambda z: abs(z["y"] - py))
         used.add(id(n))
         name = n["t"].strip()
+        if price < 1000:                    # 读错的价格（0、三位数）直接丢弃
+            continue
         out.append({"name": name, "price": price, "y": py, "kind": _kind_at(im, py)})
     return out
 
 
-def upgrade_from_list(max_price=None, kinds=("gold", "elixir"), dry=False):
-    """打开建筑列表，挑一条能付得起的升掉。返回 (item, workers_before, workers_after) 或 None。"""
-    res = read_res_vote(3)              # 必须先读：列表会遮住右上资源栏
+def find_green_button(img, box=(900, 850, 1900, 1040)):
+    """在确认弹窗底部找最大的绿色按钮，返回其中心。绿色是「确认」，灰色是「取消」，别点错。"""
+    if img is None or not img.size:
+        return None
+    x1, y1, x2, y2 = box
+    roi = img[y1:y2, x1:x2]
+    if roi.size == 0:
+        return None
+    b, g, r = roi[:, :, 0].astype(int), roi[:, :, 1].astype(int), roi[:, :, 2].astype(int)
+    # CoC 的确认按钮是黄绿：实测 rgb≈(210,244,137)，G 最高、B 最低
+    mask = ((g > 200) & (g - b > 60) & (r > 140) & (r < 252)).astype(np.uint8) * 255
+    if int(mask.sum()) // 255 < 1500:      # 绿像素太少，多半不在确认框
+        return None
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
+    n, labels, stats, cents = cv2.connectedComponentsWithStats(mask, 8)
+    if n <= 1:
+        return None
+    idx = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    if stats[idx, cv2.CC_STAT_AREA] < 3000:
+        return None
+    # 连通域含按钮阴影和高光，几何中心偏右下；实测可点区在 bbox 左上 18% 处
+    left = int(stats[idx, cv2.CC_STAT_LEFT])
+    top = int(stats[idx, cv2.CC_STAT_TOP])
+    w = int(stats[idx, cv2.CC_STAT_WIDTH])
+    h = int(stats[idx, cv2.CC_STAT_HEIGHT])
+    cx = left + int(w * 0.32)          # 水平 32%
+    cy = top + int(h * 0.18)           # 垂直 18%（实测 y≈900 有效，bbox 879~995）
+    return int(cx + x1), int(cy + y1), int(stats[idx, cv2.CC_STAT_AREA])
+
+
+
+def _village_ready():
+    """回到能读数的村庄状态。"""
     for _ in range(3):
-        if res.get("gold") and res.get("elixir"):
-            break
-        time.sleep(0.9)
-        res = read_res_vote(3)
-    w0 = read_workers(grab())
-    im = open_build_list()
-    if im is None:
-        log("  打开建筑列表失败")
-        return None
-    items = read_build_list(im)
-    if not items:
-        log("  列表没读到可升级项")
+        if not panel_open(grab()):
+            r = read_res_vote(2)
+            if r.get("gold") is not None and r.get("elixir") is not None:
+                return r
         clear_panels()
-        return None
-    budget = {"gold": res.get("gold") or 0, "elixir": res.get("elixir") or 0,
-              "dark": res.get("dark") or 0}
-    pool = [i for i in items if i["kind"] in kinds]
-    pool.sort(key=lambda i: i["price"])
-    for it in pool:
-        if max_price and it["price"] > max_price:
+        time.sleep(1.2)
+    return None
+
+
+def _read_items_retry(max_try=3):
+    """打开列表并读到条目，读不到就拖动展开重来。"""
+    for _ in range(max_try):
+        im = open_build_list()
+        if im is None:
+            clear_panels()
             continue
-        if it["price"] > budget.get(it["kind"], 0) * 0.9:
-            continue
-        log(f"  候选 {it['name']} {it['price']:,} ({it['kind']})")
+        items = read_build_list(im)
+        if items and all(i["kind"] != "?" for i in items[:2]):
+            return im, items
+        log(f"  列表不完整（{len(items)} 项），拖动展开重试")
+        sh("input swipe 1883 37 2120 37 500")
+        time.sleep(1.2)
+        im2 = grab()
+        if im2 is not None:
+            items = read_build_list(im2)
+            if items and all(i["kind"] != "?" for i in items[:2]):
+                return im2, items
+        clear_panels()
+        time.sleep(1.0)
+    return None, []
+
+
+def upgrade_from_list(max_price=None, kinds=("gold", "elixir"), dry=False, items=None, res=None, w0=None):
+    """挑一条能付得起的升掉。整条链路带状态验证，任一步不对就回村重来。"""
+    for attempt in range(2):
+        res0 = res if (res and res.get("gold")) else _village_ready()
+        if not res0:
+            log("  回不到村庄状态，放弃本轮升级")
+            return None
+        w_start = w0 or read_workers(grab())
+
+        if items:
+            im, lst = None, items
+            items = None
+        else:
+            im, lst = _read_items_retry()
+        if not lst:
+            log("  读不到建筑列表")
+            return None
+
+        budget = {"gold": res0.get("gold") or 0, "elixir": res0.get("elixir") or 0,
+                  "dark": res0.get("dark") or 0}
+        pool = [i for i in lst if i["kind"] in kinds]
+        pool.sort(key=lambda i: i["price"])
+        log(f"  预算 g={budget['gold']:,} e={budget['elixir']:,} d={budget['dark']:,} | "
+            f"候选 {[(i['name'], i['price'], i['kind']) for i in pool[:3]]}")
+
+        picked = None
+        for it in pool:
+            if max_price and it["price"] > max_price:
+                continue
+            if it["price"] > budget.get(it["kind"], 0) * 0.9:
+                continue
+            picked = it
+            break
+        if picked is None:
+            log("  没有付得起的项目")
+            clear_panels()
+            return None
         if dry:
             clear_panels()
-            return it, w0, w0
-        cf, head = None, ""
-        for _try in range(4):
-            tap(LIST_ROW_X, it["y"], 1.0)
+            return picked, w_start, w_start
+
+        # 点行 → 等确认框；列表行点击常被丢，最多试 6 次
+        cf, ok = None, False
+        for _t in range(6):
+            tap(LIST_ROW_X, picked["y"], 0.9)
             cf = grab()
             if cf is None:
                 continue
-            head = " ".join(t["t"] for t in ocr_all(cf, (400, 20, 1800, 130)))
+            head = " ".join(t["t"] for t in ocr_all(cf) if t["y"] < 140)
             if "升至" in head:
+                ok = True
                 break
-        if "升至" not in head:
-            log("  没弹确认框，跳过")
+        if not ok:
+            log("  没弹出确认框，回村重来")
             clear_panels()
+            time.sleep(1.0)
             continue
-        tap(*CONFIRM_BTN, 2.0)
-        time.sleep(1.5)
-        clear_panels()
-        res1 = read_res_vote(3)
-        spent = budget.get(it["kind"], 0) - (res1.get(it["kind"]) or 0)
-        if spent >= it["price"] * 0.9:
-            log(f"  升级成功 {it['name']} 扣 {it['kind']} {spent:,}")
-            return it, w0, read_workers(grab())
-        log(f"  未见扣款（{it['kind']} {spent:,}/{it['price']:,}），可能未生效")
-        return None
-    log("  没有付得起的项目")
-    clear_panels()
-    return None
 
+        # 点确认：用绿色像素定位，找不到退回固定坐标；点到弹窗消失为止
+        btn = find_green_button(cf)
+        pos = (btn[0], btn[1]) if btn else CONFIRM_BTN
+        log(f"  确认框已弹出，按钮 @{pos}")
+        for _c in range(3):
+            tap(pos[0], pos[1], 1.3)
+            time.sleep(1.0)
+            chk = grab()
+            if chk is None:
+                continue
+            if not any("升至" in t["t"] for t in ocr_all(chk) if t["y"] < 140):
+                break
+
+        # 验证：回村后看扣款或工人数
+        time.sleep(2.0)
+        res1 = read_res_until(3, tries=4, gap=1.2)
+        clear_panels()
+        time.sleep(1.2)
+        if res1.get("gold") is None:
+            res1 = read_res_until(3, tries=3, gap=1.0)
+        w1 = read_workers(grab())
+        cur = res1.get(picked["kind"])
+        spent = (budget.get(picked["kind"], 0) - cur) if cur is not None else None
+        paid = (picked["price"] > 0 and spent is not None
+                and spent >= picked["price"] * 0.9)
+        busy = (w_start and w1 and w_start[0] is not None and w1[0] is not None
+                and w1[0] > w_start[0])
+        if paid or busy:
+            why = f"扣 {picked['kind']} {spent:,}" if paid else f"工人 {w_start[0]}->{w1[0]}"
+            log(f"  升级成功 {picked['name']}（{why}）")
+            return picked, w_start, w1
+        log(f"  未确认生效（spent={spent} 工人{w_start}->{w1}），重试")
+        clear_panels()
+        time.sleep(1.2)
+    log("  两次尝试都没成功")
+    return None

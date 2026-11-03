@@ -19,11 +19,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from coc_patrol2 import (sh, grab, enter_village, read_res_vote, read_workers, read_star,
                          find_bubbles, collect_one, init_capture, close_capture, panel_open,
                          clear_panels, open_build_list, read_build_list, upgrade_from_list,
-                         log, PKG, ACT)
+                         read_res_until, log, PKG, ACT)
 import coc_config
 
-HIST = os.environ.get("COC_HISTORY") or os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "history")
+HIST = os.environ.get("COC_HISTORY") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "history")
 KEEP_DAYS = 30          # 历史保留天数，截图每轮约 1.4MB，30 天 × 4 轮 ≈ 170MB
 
 
@@ -121,7 +120,7 @@ def main():
 
         clear_panels()
         time.sleep(3.0)                     # 收集后有金色高亮动画，OCR 会认成乱码，等它结束
-        after = read_res_vote(3)
+        after = read_res_until(3, tries=4, gap=1.2)
         w = read_workers(grab())
         star = read_star(grab())
         gain = {k: (after[k] - before[k]) if after.get(k) is not None and before.get(k) is not None else None
@@ -137,12 +136,16 @@ def main():
             log(f"可升级 {len(items)} 项: " +
                 "; ".join(f"{i['name']}({i['price']:,},{i['kind']})" for i in items))
             meta["items"] = items
-            free_w = (w[1] - w[0]) if (w[0] is not None and w[1] is not None) else 0
+            free_w = w[0] if w[0] is not None else 0   # (空闲, 总数)，不要再减
             rounds = cfg["max_upgrades"] if cfg["upgrade"] else 0
             if free_w >= cfg["min_free_workers"] and items and rounds > 0:
                 for _n in range(rounds):
+                    # 列表已经开着，把读到的 items 直接传进去，避免重复点锤子把它关掉
                     up = upgrade_from_list(max_price=cfg["max_price"],
-                                           kinds=tuple(cfg["upgrade_kinds"]))
+                                           kinds=tuple(cfg["upgrade_kinds"]),
+                                           items=items if _n == 0 else None,
+                                           res=after if _n == 0 else None,   # 用收集后已读到的值，避免再读一次拿到空
+                                           w0=w if _n == 0 else None)
                     log(f"升级结果 {up[0] if up else None}")
                     if not up:
                         break
@@ -153,7 +156,7 @@ def main():
                     if free_w < cfg["min_free_workers"]:
                         break
             else:
-                log(f"跳过升级 空闲工人={free_w} 允许升级={rounds}")
+                log(f"跳过升级 空闲工人={free_w} 允许升级={rounds}（需 ≥{cfg['min_free_workers']}）")
             time.sleep(1.0)
             clear_panels()
             time.sleep(2.5)                 # 同上：升级后资源栏也有高亮
