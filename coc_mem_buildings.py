@@ -45,7 +45,6 @@
   python3 coc_mem_buildings.py --probe GOLD     # 打印名字里含 GOLD 的建筑
 """
 import argparse
-import base64
 import json
 import os
 import struct
