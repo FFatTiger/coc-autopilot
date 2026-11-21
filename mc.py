@@ -44,13 +44,34 @@ class Minicap:
         """返回 (logical_w, logical_h, rotation)。
 
         cur= 已经是旋转后的逻辑尺寸（横屏时 2220x1080），minicap 用它直接投影。
+
+        必须取「内置屏」(mDisplayId=0) 那一段：设备上同时存在虚拟屏时
+        （droidVNC-NG、scrcpy 之类会建一个几百像素的 virtual display），
+        dumpsys 里虚拟屏排在内置屏前面，直接 grep -m1 'cur=' 会拿到虚拟屏的
+        尺寸，minicap 按小尺寸投影，画面缩成 1/3，后面所有按 2220x1080 写死
+        的坐标全废（进村判据都认不出来）。
         """
-        out = _adb("shell", "dumpsys window displays | grep -m1 'cur='").stdout
         cur = None
-        for tok in out.split():
-            if tok.startswith("cur="):
-                cur = tok[4:]
+        out = _adb("shell", "dumpsys window displays | grep -E 'Display: mDisplayId=|cur='").stdout
+        in_default = False
+        for line in out.splitlines():
+            if "Display: mDisplayId=" in line:
+                in_default = line.strip().endswith("mDisplayId=0")
+                continue
+            if not in_default:
+                continue
+            for tok in line.split():
+                if tok.startswith("cur="):
+                    cur = tok[4:]
+                    break
+            if cur:
                 break
+        if not cur:                       # 拿不到内置屏信息时退回原来的取法
+            out = _adb("shell", "dumpsys window displays | grep -m1 'cur='").stdout
+            for tok in out.split():
+                if tok.startswith("cur="):
+                    cur = tok[4:]
+                    break
         w, h = (int(v) for v in cur.split("x"))
         o = _adb("shell", "dumpsys display | grep -m1 'mCurrentOrientation'").stdout
         rot = int(o.split("=")[1].strip()) if "=" in o else 0

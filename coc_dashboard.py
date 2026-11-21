@@ -17,8 +17,9 @@ from urllib.parse import urlparse
 
 HIST = os.environ.get("COC_HISTORY") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "history")
-PORT = 8899
+PORT = int(os.environ.get("COC_PORT") or 8899)   # 同一台机跑第二份看板（比如试新后端）时改这个
 MAX_RUNS = 200
+BACKEND_LABELS = {"ocr": "OCR 后端", "memory": "内存后端"}
 
 RUN_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "coc_patrol_run.py")
 PYTHON = os.environ.get("COC_PYTHON") or sys.executable
@@ -153,7 +154,7 @@ PAGE = """<!doctype html>
 <div class="wrap">
   <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:16px">
     <div>
-      <h1>部落冲突 · 巡检看板</h1>
+      <h1>部落冲突 · 巡检看板 <span class="pill" id="bkBadge" title="当前读数后端">__BACKEND_LABEL__</span></h1>
       <div class="sub" id="sub">加载中…</div>
     </div>
     <div style="display:flex;gap:8px">
@@ -202,6 +203,17 @@ PAGE = """<!doctype html>
       <label>巡检时间</label>
       <div class="times" id="times"></div>
       <div class="desc">每天在这些时刻跑一轮。</div>
+    </div>
+
+    <div class="field">
+      <label>读数后端</label>
+      <div class="chips">
+        <button class="chip" data-backend="ocr">OCR（截图识别）</button>
+        <button class="chip" data-backend="memory">内存（root 读内存）</button>
+      </div>
+      <div class="desc">OCR 兼容性好、不需要 root，但数字会认错位、增量只能靠投票估；
+        内存逐位精确、地址失效能自愈，但要求手机 root 并且要先定位一次地址。
+        保存后下一轮巡检生效。</div>
     </div>
 
     <div class="field">
@@ -289,14 +301,16 @@ function render(runs){
     document.getElementById('none').style.display = 'block';
     return;
   }
-  sub.textContent = `最近一轮 ${when(latest.start)} · 服务正常`;
+  sub.textContent = `最近一轮 ${when(latest.start)} · 服务正常`
+    + (latest.backend ? ` · 本轮读数 ${BK_LABEL(latest.backend)}` : '');
   document.getElementById('none').style.display = runs.length ? 'none' : 'block';
 
   const c = document.getElementById('cards');
   const pick = o => (o && o.gold !== null && o.gold !== undefined && o.gold > 0) ? o : null;
   const res = pick(latest.final) || pick(latest.after) || pick(latest.before) || latest.after || {};
   const wk = latest.workers || [null, null];
-  const free = (wk[0] !== null && wk[1] !== null) ? wk[1] - wk[0] : null;
+  // read_workers() 返回的是 (空闲, 总数)：0/5 表示全在忙，不是全空闲
+  const free = (wk[0] !== null && wk[1] !== null) ? wk[0] : null;
   c.innerHTML = `
     <div class="card"><div class="k"><i class="dot gold"></i>金币</div><div class="v">${fmt(res.gold)}
       <small>${dlt((latest.gain||{}).gold)}</small></div></div>
@@ -458,7 +472,17 @@ function renderTimes(list){
   });
 }
 
+const BK_LABEL = b => b === 'memory' ? '内存后端' : 'OCR 后端';
+
+function setBadge(bk){
+  const el = document.getElementById('bkBadge');
+  if (el) el.textContent = BK_LABEL(bk);
+}
+
 function syncChips(){
+  document.querySelectorAll('[data-backend]').forEach(b => {
+    b.classList.toggle('on', (CFG.backend || 'ocr') === b.dataset.backend);
+  });
   document.querySelectorAll('[data-toggle]').forEach(b => {
     const key = b.dataset.toggle;
     const want = b.dataset.val === '1';
@@ -493,6 +517,8 @@ function closeCfg(){ var m = document.getElementById('mask'); if (m) m.classList
 document.addEventListener('click', e => {
   const t = e.target.closest('[data-toggle]');
   if (t){ CFG[t.dataset.toggle] = t.dataset.val === '1'; syncChips(); return; }
+  const bkb = e.target.closest('[data-backend]');
+  if (bkb){ CFG.backend = bkb.dataset.backend; syncChips(); return; }
   const k = e.target.closest('[data-kind]');
   if (k){
     const set = new Set(CFG.upgrade_kinds || []);
@@ -513,7 +539,10 @@ async function saveCfg(){
     body: JSON.stringify(CFG)
   });
   if (!r.ok) return toast('保存失败');
-  toast('已保存，下一轮生效');
+  const saved = await r.json().catch(() => CFG);
+  CFG.backend = saved.backend || CFG.backend;
+  setBadge(CFG.backend);
+  toast('已保存，下一轮生效（' + BK_LABEL(CFG.backend) + '）');
   closeCfg();
   load();
 }
@@ -592,6 +621,7 @@ bind('mask', 'click', function(e){
 });
 document.addEventListener('keydown', function(e){ if (e.key === 'Escape') closeCfg(); });
 
+if (window.__BOOT__ && window.__BOOT__.config) setBadge(window.__BOOT__.config.backend);
 bootRender();
 load();
 setInterval(load, 60000);
@@ -688,12 +718,23 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path in ("/", "/index.html"):
-            boot = json.dumps({"runs": load_runs(), "config": coc_config.load()},
+            cfg = coc_config.load()
+            boot = json.dumps({"runs": load_runs(), "config": cfg},
                               ensure_ascii=False).replace("</", "<\\/")
+            # 后端徽标服务端先渲染一次，页面还没跑 JS 时也能看出当前是哪个后端
+            html = PAGE.replace("__BACKEND_LABEL__",
+                                BACKEND_LABELS.get(cfg.get("backend", "ocr"), "OCR 后端"), 1)
             # 必须注入在主脚本之前，否则 bootRender/openCfg 读 window.__BOOT__ 还是 undefined
-            html = PAGE.replace("<script>\nwindow.onerror",
+            html = html.replace("<script>\nwindow.onerror",
                                 "<script>window.__BOOT__=" + boot + ";</script>\n<script>\nwindow.onerror", 1)
-            return self._send(200, html, "text/html; charset=utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(html.encode())))
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Coc-Backend", cfg.get("backend", "ocr"))
+            self.end_headers()
+            self.wfile.write(html.encode())
+            return
         if path == "/api/runs":
             return self._send(200, json.dumps(load_runs(), ensure_ascii=False))
         if path == "/api/config":

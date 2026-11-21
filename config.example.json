@@ -1,9 +1,21 @@
 {
+  "backend": "memory",
+  "_说明": "backend 决定读数和判断的来源：ocr = 截图 + OCR + 模板匹配（不需要 root）；memory = root 读 /proc/<pid>/mem（逐位精确、地址失效能自愈，还能从内存枚举建筑，但要求手机已 root）。看板设置页里也能切换。",
+  "_schedule说明": "schedule 只对 OCR 后端生效（cron 每小时叫一次，脚本自己判断到点没）。memory 后端按 cron 的频率跑（每 10 分钟一轮），这行排期不影响它。",
   "schedule": ["09:00", "13:00", "18:00", "22:00"],
   "collect": true,
   "upgrade": true,
   "upgrade_kinds": ["gold", "elixir"],
   "max_price": 3000000,
   "max_upgrades": 1,
-  "min_free_workers": 1
+  "min_free_workers": 1,
+
+  "_memory说明": "以下只对 memory 后端生效。max_targets = 每轮最多试几个目标（实际还受空闲工人数限制）；budget 用 max_price 卡；只升 currency 指定的货币（升级面板的币种还要再过一遍校验）。",
+  "max_targets": 5,
+  "builders": 5,
+  "include_walls": false,
+  "include_bb": false,
+  "currency": "gold",
+  "build_max_h": 168,
+  "mem_cooldown_h": 24
 }

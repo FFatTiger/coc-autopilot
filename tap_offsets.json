@@ -1,0 +1,78 @@
+{
+ "Cannon": {
+  "dx": 0.0,
+  "dy": 28.0
+ },
+ "Archer Tower": {
+  "dx": 0.0,
+  "dy": 28.0
+ },
+ "Wizard Tower": {
+  "dx": 0.0,
+  "dy": 28.0
+ },
+ "Air Defense": {
+  "dx": 0.0,
+  "dy": 28.0
+ },
+ "Hidden Tesla": {
+  "dx": 0.0,
+  "dy": 28.0
+ },
+ "Bomb Tower": {
+  "dx": 0.0,
+  "dy": 28.0
+ },
+ "X-Bow": {
+  "dx": 0.0,
+  "dy": 28.0
+ },
+ "Inferno Tower": {
+  "dx": 0.0,
+  "dy": 28.0
+ },
+ "Barracks": {
+  "dx": 0.0,
+  "dy": -20.0
+ },
+ "Mortar": {
+  "dx": 0.0,
+  "dy": 45.0
+ },
+ "Spell Factory": {
+  "dx": 0.0,
+  "dy": 45.0
+ },
+ "Dark Elixir Drill": {
+  "dx": 0.0,
+  "dy": 45.0
+ },
+ "Gold Mine": {
+  "dx": 0.0,
+  "dy": 42.0
+ },
+ "Elixir Collector": {
+  "dx": 0.0,
+  "dy": 28.0
+ },
+ "Gold Storage": {
+  "dx": 0.0,
+  "dy": 30.0
+ },
+ "Elixir Storage": {
+  "dx": 0.0,
+  "dy": 30.0
+ },
+ "Army Camp": {
+  "dx": 0.0,
+  "dy": 45.0
+ },
+ "Laboratory": {
+  "dx": 0.0,
+  "dy": 28.0
+ },
+ "Eagle Artillery": {
+  "dx": 0.0,
+  "dy": 38.0
+ }
+}

@@ -8,14 +8,27 @@ __pycache__/
 # 运行时产物
 config.json
 history/
+logs/
 *.log
 *.mp4
+*.jpg
 
 # 编辑器
 .vscode/
 .idea/
 .DS_Store
 
-# 本地调试
+# 本地调试 / 备份
 /tmp/
 *.bak
+*.bin
+*.npy
+*.pkl
+
+# 内存后端的运行期状态（资源地址 / 镜头变换 / 建筑池 / 施工跟踪，随进程和画面变，不入库）
+coc_state.json
+mem_calib.json
+coc_auto_state.json
+building_pool.json
+building_types.json
+building_blocked.json

@@ -1,12 +1,29 @@
 #!/usr/bin/env python3
-"""部落冲突定时巡检：进村 -> 收资源 -> 读工人/星星 -> 建筑列表巡检 -> 有工人且付得起就升一级。
+"""部落冲突巡检：唯一的生产入口。读数后端由 config 的 backend 决定（--backend 可临时覆盖）。
 
-安全边界：
-- 只点收集气泡和建筑列表里的行，不盲点坐标；
-- 只升级 gold/elixir 项目，暗黑重油项目一律不碰（留给人工）；
-- 单次升级价格上限 MAX_PRICE；
+两种后端对外接口一致，差别只在「数字从哪来、升级怎么验」：
+
+- backend = "ocr"    截图 + OCR + 模板匹配，模块 coc_patrol2。每轮 force-stop 重开游戏进村。
+- backend = "memory" 读 /proc/<pid>/mem，模块 coc_backend_mem（需要 root）。
+                     一轮由 coc_mem_auto 执行：收资源、数工人、内存枚举建筑、
+                     三层面板校验升级。不重开游戏（靠常驻进程保活、地址才长期有效）。
+
+安全边界（两种后端一样）：
+- 只点收集气泡（内存后端是标定表里的采集点）和「升级」按钮，不盲点坐标；
+- 只升级 gold 项目，暗黑重油/圣水项目一律不碰（后者要显式在 upgrade_kinds 里开）；
+- 单次升级价格上限 max_price；每轮最多 max_upgrades 笔、最多试 max_targets 个目标；
 - 任何面板认不出就用 BACK + 点空地退出，不做猜测性点击。
+
+每轮记录落在 history/<时间戳>/：meta.json + before.jpg + after.jpg，看板读的就是它。
+
+用法:
+  python3 coc_patrol_run.py                        # 真跑一轮（后端按 config）
+  python3 coc_patrol_run.py --backend memory       # 强制内存后端跑一轮
+  python3 coc_patrol_run.py --dry                  # 只读不点：读数、采集点、升级候选
+  python3 coc_patrol_run.py --if-due               # 给 cron 用，没到点就静默退出（仅 OCR 后端）
+  python3 coc_patrol_run.py --backend memory --dry # 内存后端空跑一轮（迁代码/验证用）
 """
+import argparse
 import json
 import os
 import shutil
@@ -15,14 +32,58 @@ import time
 
 import cv2
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from coc_patrol2 import (sh, grab, enter_village, read_res_vote, read_workers, read_star,
-                         find_bubbles, collect_one, init_capture, close_capture, panel_open,
-                         clear_panels, open_build_list, read_build_list, upgrade_from_list,
-                         read_res_until, log, PKG, ACT)
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
 import coc_config
 
-HIST = os.environ.get("COC_HISTORY") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "history")
+
+def parse_args(argv=None):
+    ap = argparse.ArgumentParser(description="部落冲突巡检（生产入口）")
+    ap.add_argument("--backend", choices=("ocr", "memory"), default=None,
+                    help="临时覆盖 config 里的 backend")
+    ap.add_argument("--dry", action="store_true", help="只读不点")
+    ap.add_argument("--if-due", dest="if_due", action="store_true",
+                    help="没到 schedule 里的点就静默退出（OCR 后端用）")
+    ap.add_argument("--no-collect", dest="no_collect", action="store_true")
+    ap.add_argument("--no-upgrade", dest="no_upgrade", action="store_true")
+    # 下面这几个只对内存后端有意义，不填就按 config
+    ap.add_argument("--max-targets", type=int, default=None, help="每轮最多试几个升级目标")
+    ap.add_argument("--max-cost", type=int, default=None, help="单次升级价格上限")
+    ap.add_argument("--currency", default=None, help="只升这个货币的建筑（默认 gold）")
+    ap.add_argument("--builders", type=int, default=None, help="工人总数（默认 5）")
+    ap.add_argument("--include-bb", dest="include_bb", action="store_true", default=None,
+                    help="包含夜世界建筑")
+    ap.add_argument("--no-walls", dest="include_walls", action="store_false", default=None,
+                    help="不升城墙")
+    ap.add_argument("--quiet", action="store_true")
+    return ap.parse_args(argv)
+
+
+ARGS = parse_args()
+CFG0 = coc_config.load()
+BACKEND = ARGS.backend or CFG0.get("backend", "ocr")
+
+# 后端只在这一处分叉：两边导出同名函数，下面的流程一个字都不用改。
+if BACKEND == "memory":
+    from coc_backend_mem import (sh, grab, enter_village, read_res_vote, read_workers,
+                                 read_star, find_bubbles, collect_one, init_capture,
+                                 close_capture, panel_open, clear_panels, open_build_list,
+                                 read_build_list, upgrade_from_list, read_res_until, log,
+                                 PKG, ACT)
+else:
+    from coc_patrol2 import (sh, grab, enter_village, read_res_vote, read_workers, read_star,
+                             find_bubbles, collect_one, init_capture, close_capture, panel_open,
+                             clear_panels, open_build_list, read_build_list, upgrade_from_list,
+                             read_res_until, log, PKG, ACT)
+
+# 每项读数的来源，写进 meta.json 给看板看
+if BACKEND == "memory":
+    SOURCES = {"res": "mem", "workers": "ocr", "star": "ocr",
+               "builders": "mem", "upgrade": "mem-panel"}
+else:
+    SOURCES = {"res": "ocr", "workers": "ocr", "star": "ocr"}
+
+HIST = os.environ.get("COC_HISTORY") or os.path.join(HERE, "history")
 KEEP_DAYS = 30          # 历史保留天数，截图每轮约 1.4MB，30 天 × 4 轮 ≈ 170MB
 
 
@@ -58,22 +119,72 @@ def prune(days=KEEP_DAYS):
     return n
 
 
-def main():
-    cfg = coc_config.load()
-    if "--if-due" in sys.argv:
-        ok, now = coc_config.due_now(cfg)
-        if not ok:
-            return 0                       # 没到点，静默退出（cron 每小时叫一次）
-        log(f"到点执行 {now:%Y-%m-%d %H:%M} (北京时间)")
+def write_meta(run_dir, meta):
+    try:
+        with open(os.path.join(run_dir, "meta.json"), "w") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=1, default=float)
+    except Exception as e:
+        log(f"写 meta 失败 {e}")
 
-    run_id = time.strftime("%Y%m%d_%H%M%S")
-    run_dir = os.path.join(HIST, run_id)
-    os.makedirs(run_dir, exist_ok=True)
-    meta = {"id": run_id, "start": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "status": "running", "before": None, "after": None, "gain": None,
-            "workers": None, "star": None, "bubbles": 0, "collected": 0,
-            "items": [], "upgrade": None, "upgrades": [], "duration": None,
-            "error": None, "config": cfg}
+
+# ---------------------------------------------------------------- 内存后端
+def run_memory(cfg, run_dir, meta):
+    """内存后端一轮：交给 coc_mem_auto 跑，回来补齐看板要的通用字段。"""
+    from coc_mem_auto import MemAuto
+
+    auto = MemAuto(cfg, ARGS, quiet=ARGS.quiet)
+    try:
+        rec = auto.run_round(run_dir=run_dir, dry=ARGS.dry,
+                             collect=cfg["collect"] and not ARGS.no_collect,
+                             upgrade=cfg["upgrade"] and not ARGS.no_upgrade)
+    finally:
+        auto.close()
+    meta.update({k: rec.get(k) for k in
+                 ("before", "after", "final", "gain", "delta", "collected", "bubbles",
+                  "builders", "n_candidates", "n_plan",
+                  "candidates", "calib", "brightness", "ensure", "notes", "n_ok")
+                 if rec.get(k) is not None})
+    # 看板的「可升级项」读的是 items（OCR 后端填的是建筑列表行），内存后端这里换成
+    # 内存枚举出来的候选：名字里带「当前级→下一级」，价格没有就留 None（看板显示 —）。
+    meta["items"] = [dict(name=c.get("name"), price=c.get("cost"),
+                         kind=c.get("currency") or "gold")
+                     for c in (rec.get("candidates") or [])]
+    meta["collect_items"] = rec.get("items") or []
+    # 升级结果分三种：真升了 / dry 只挑不点 / 试了没成。看板只认「真升了」，
+    # 所以 dry 的候选单独放 dry_upgrade，别让看板把候选显示成已升级。
+    up = rec.get("upgrade") or {}
+    if up.get("ok"):
+        meta["upgrade"] = up
+        meta["upgrades"] = rec.get("upgrades") or [up]
+    elif up.get("why") == "dry":
+        meta["dry_upgrade"] = dict(name=up.get("target"), price=up.get("price"))
+        meta["dry_candidates"] = [a.get("target") for a in (up.get("attempts") or [])]
+    elif up:
+        meta["upgrade_fail"] = dict(name=up.get("target"), why=up.get("why"))
+    meta["alerts"] = rec.get("alerts") or []
+    meta["status"] = rec.get("status") or "error"
+    if rec.get("error"):
+        meta["error"] = rec["error"]
+    if rec.get("modal"):
+        meta["modal"] = rec["modal"]
+    if rec.get("relocate"):
+        meta["relocate"] = rec["relocate"]
+
+    # 工人/星星的内存读数还没定位（是 UI 文本），补一次 OCR 给看板卡片用。
+    # 内存的 builders 更准（按等级是否上涨判断在施工），两个都给看板。
+    try:
+        img = grab()
+        w = read_workers(img)
+        meta["workers"] = list(w)
+        meta["star"] = read_star(img)
+    except Exception as e:
+        meta["alerts"].append(f"ocr_workers_failed: {type(e).__name__}")
+    return 0 if meta["status"] == "ok" else 1
+
+
+# ---------------------------------------------------------------- OCR 后端
+def run_ocr(cfg, run_dir, meta):
+    """OCR 后端一轮：原巡检流程（截图识别 + 列表升级），一并写同一份 meta。"""
     init_capture()
     t0 = time.time()
     try:
@@ -110,6 +221,9 @@ def main():
 
         ok = 0
         for i, (kind, x, y, _sc) in enumerate(bubbles):
+            if ARGS.dry:                     # --dry：不点击，只把目标列出来
+                log(f"  [{i+1}/{len(bubbles)}] {kind} ({x},{y}) dry，不点击")
+                continue
             if time.time() - t0 > 240:
                 log(f"时间到，停在 {i}/{len(bubbles)}")
                 break
@@ -127,7 +241,7 @@ def main():
                 for k in ("gold", "elixir", "dark")}
         log(f"收取后 {after} | 成功 {ok}/{len(bubbles)} | 收益 {gain}")
         log(f"建筑工人 {w} | 胜利之星 {star}")
-        meta.update({"after": after, "gain": gain, "workers": list(w),
+        meta.update({"after": after, "gain": gain, "delta": gain, "workers": list(w),
                      "star": star, "bubbles": len(bubbles), "collected": ok})
 
         bl = open_build_list()
@@ -145,9 +259,14 @@ def main():
                                            kinds=tuple(cfg["upgrade_kinds"]),
                                            items=items if _n == 0 else None,
                                            res=after if _n == 0 else None,   # 用收集后已读到的值，避免再读一次拿到空
-                                           w0=w if _n == 0 else None)
+                                           w0=w if _n == 0 else None,
+                                           dry=ARGS.dry)
                     log(f"升级结果 {up[0] if up else None}")
                     if not up:
+                        break
+                    if ARGS.dry:                      # 只挑不点：记下候选，别当成真升过
+                        meta["dry_upgrade"] = {"name": up[0]["name"], "price": up[0]["price"],
+                                               "kind": up[0]["kind"]}
                         break
                     meta["upgrades"].append({"name": up[0]["name"], "price": up[0]["price"],
                                              "kind": up[0]["kind"]})
@@ -179,15 +298,52 @@ def main():
         close_capture()
         sh(f"am force-stop {PKG}")
         sh("input keyevent KEYCODE_SLEEP")
+
+
+# ---------------------------------------------------------------- 主流程
+def main():
+    cfg = coc_config.load()
+    if ARGS.backend:
+        cfg["backend"] = ARGS.backend
+    # 命令行覆盖配置（只对内存后端有意义，OCR 后端读不到这些键也不受影响）
+    for cli, key in (("max_targets", "max_targets"), ("max_cost", "max_price"),
+                     ("currency", "currency"), ("builders", "builders"),
+                     ("include_bb", "include_bb"), ("include_walls", "include_walls")):
+        v = getattr(ARGS, cli, None)
+        if v is not None:
+            cfg[key] = v
+    dry = ARGS.dry
+
+    if ARGS.if_due and BACKEND != "memory":
+        ok, now = coc_config.due_now(cfg)
+        if not ok:
+            return 0                       # 没到点，静默退出（cron 每小时叫一次）
+        log(f"到点执行 {now:%Y-%m-%d %H:%M} (北京时间)")
+
+    run_id = time.strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(HIST, run_id)
+    os.makedirs(run_dir, exist_ok=True)
+    meta = {"id": run_id, "start": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "status": "running", "backend": BACKEND, "dry": dry, "sources": SOURCES,
+            "before": None, "after": None, "gain": None, "final": None,
+            "workers": None, "star": None, "bubbles": 0, "collected": 0,
+            "items": [], "upgrade": None, "upgrades": [], "dry_upgrade": None,
+            "builders": None, "alerts": [], "duration": None, "error": None,
+            "config": cfg}
+    t0 = time.time()
+    rc = 1
+    try:
+        if BACKEND == "memory":
+            rc = run_memory(cfg, run_dir, meta)
+        else:
+            rc = run_ocr(cfg, run_dir, meta)
+    finally:
         meta["duration"] = round(time.time() - t0, 1)
         meta["end"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-        try:
-            with open(os.path.join(run_dir, "meta.json"), "w") as f:
-                json.dump(meta, f, ensure_ascii=False, indent=1)
-        except Exception as e:
-            log(f"写 meta 失败 {e}")
-        log(f"用时 {meta['duration']}s，已熄屏，记录 {run_id}")
+        write_meta(run_dir, meta)
+        log(f"用时 {meta['duration']}s，记录 {run_id}（{BACKEND} 后端）")
         prune()
+    return rc
 
 
 if __name__ == "__main__":

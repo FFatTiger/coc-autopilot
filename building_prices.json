@@ -1,0 +1,237 @@
+{
+"Cannon|13": {
+"currency": "gold",
+"cost": 1000000,
+"source": "upgrade_delta",
+"at": "2026-11-21 16:11:23"
+},
+"Cannon|14": {
+"currency": "gold",
+"cost": 1200000,
+"source": "panel_probe",
+"at": "2026-11-21T15:51:30-05:00",
+"verified_level": 14,
+"tap_dy": 28,
+"shot": "work/panel_Cannon_L14_price.png",
+"up_btn": [
+1108,
+828
+],
+"note": "原始全幅截图被后续 L13 探测覆盖，价格裁图保留"
+},
+"Archer Tower|17": {
+"currency": "gold",
+"cost": 2000000,
+"source": "panel_probe",
+"at": "2026-11-21T15:53:30-05:00",
+"verified_level": 17,
+"tap_dy": 28,
+"shot": "work/probe_Archer_Tower.png",
+"up_btn": [
+1108,
+828
+]
+},
+"Wizard Tower|9": {
+"currency": "gold",
+"cost": 2000000,
+"source": "upgrade_delta",
+"at": "2026-11-21 16:31:42"
+},
+"Air Defense|10": {
+"currency": "gold",
+"cost": 4000000,
+"source": "panel_probe",
+"at": "2026-11-21T15:53:45-05:00",
+"verified_level": 10,
+"tap_dy": 28,
+"shot": "work/probe_Air_Defense.png",
+"up_btn": [
+1211,
+828
+]
+},
+"Hidden Tesla|10": {
+"currency": "gold",
+"cost": 2800000,
+"source": "panel_probe",
+"at": "2026-11-21T15:53:50-05:00",
+"verified_level": 10,
+"tap_dy": 28,
+"shot": "work/probe_Hidden_Tesla.png",
+"up_btn": [
+1211,
+828
+]
+},
+"Bomb Tower|6": {
+"currency": "gold",
+"cost": 3300000,
+"source": "panel_probe",
+"at": "2026-11-21T15:53:55-05:00",
+"verified_level": 6,
+"tap_dy": 28,
+"shot": "work/probe_Bomb_Tower.png",
+"up_btn": [
+1108,
+828
+]
+},
+"X-Bow|5": {
+"currency": "gold",
+"cost": 4300000,
+"source": "panel_probe",
+"at": "2026-11-21T15:54:00-05:00",
+"verified_level": 5,
+"tap_dy": 28,
+"shot": "work/probe_X-Bow.png",
+"up_btn": [
+1003,
+828
+]
+},
+"Inferno Tower|4": {
+"currency": "gold",
+"cost": 4000000,
+"source": "panel_probe",
+"at": "2026-11-21T15:54:05-05:00",
+"verified_level": 4,
+"tap_dy": 28,
+"shot": "work/probe_Inferno_Tower.png",
+"up_btn": [
+1003,
+828
+]
+},
+"Barracks|14": {
+"currency": "elixir",
+"cost": 9000000,
+"source": "panel_observed_2026-11-21",
+"at": "2026-11-21 15:29:00",
+"verified_level": 14,
+"tap_dy": -20,
+"shot": "work/panel3.png"
+},
+"Inferno Tower|1": {
+"currency": "gold",
+"cost": 1200000,
+"source": "upgrade_delta",
+"at": "2026-11-21 16:41:23"
+},
+"Gold Mine|14": {
+"currency": "elixir",
+"cost": 1200000,
+"source": "panel_probe",
+"at": "2026-11-21T16:53:16-05:00",
+"verified_level": 14,
+"shot": "work/probe_Gold_Mine.png",
+"note": "面板价 + 圣水图标（金币↔圣水 交叉）"
+},
+"Gold Storage|13": {
+"currency": "elixir",
+"cost": 2800000,
+"source": "panel_probe",
+"at": "2026-11-21T16:53:55-05:00",
+"verified_level": 13,
+"shot": "work/probe_Gold_Storage.png",
+"note": "面板价 + 圣水图标（旧记录误记 gold）"
+},
+"Laboratory|10": {
+"currency": "elixir",
+"cost": 5500000,
+"source": "panel_probe",
+"at": "2026-11-21T16:54:23-05:00",
+"verified_level": 10,
+"shot": "work/probe_Laboratory.png",
+"note": "面板价 + 圣水图标（旧记录误记 gold）；实验室在 NEVER_UPGRADE，只记价"
+},
+"Mortar|8": {
+"currency": "gold",
+"cost": 1600000,
+"source": "panel_probe_red",
+"at": "2026-11-21T17:01:27-05:00",
+"digits": "1600000",
+"up_btn": [
+1003,
+828
+],
+"n_cards": 2,
+"title_level": 8,
+"tap_dx": 0,
+"tap_dy": 45
+},
+"Elixir Collector|15": {
+"currency": "gold",
+"cost": 2000000,
+"source": "panel_probe_red",
+"at": "2026-11-21T17:04:07-05:00",
+"verified_level": 15,
+"shot": "work/probe_Elixir_Collector.png",
+"note": "红字（金币 208k 不够）读出，参考值"
+},
+"Elixir Storage|13": {
+"currency": "gold",
+"cost": 2800000,
+"source": "panel_probe_red",
+"at": "2026-11-21T17:04:07-05:00",
+"verified_level": 13,
+"shot": "work/probe_Elixir_Storage.png",
+"note": "红字读出（补了 8/0 分洞后与截图一致）"
+},
+"Army Camp|10": {
+"currency": "elixir",
+"cost": 7000000,
+"source": "panel_probe",
+"at": "2026-11-21T17:04:54-05:00",
+"digits": "7000000",
+"up_btn": [
+1003,
+828
+],
+"n_cards": 3,
+"title_level": 10,
+"tap_dx": 0,
+"tap_dy": 45
+},
+"Eagle Artillery|3": {
+"currency": "gold",
+"cost": 10000000,
+"source": "panel_visual",
+"at": "2026-11-21T17:04:07-05:00",
+"verified_level": 3,
+"shot": "work/hit_Eagle_Artillery_0.png",
+"tap_dx": 0,
+"tap_dy": 38,
+"note": "面板「天鹰火炮（3级）升级 10 000 000 金币」；价格牌 10 与 0 粘连成一块，自动读数放弃，人工看截图确认"
+},
+"Dark Elixir Drill|5": {
+"currency": "elixir",
+"cost": 800000,
+"source": "panel_probe",
+"at": "2026-11-21T17:04:45-05:00",
+"digits": "800000",
+"up_btn": [
+1202,
+884
+],
+"n_cards": 4,
+"title_level": 5,
+"tap_dx": 0,
+"tap_dy": 45
+},
+"Spell Factory|6": {
+"currency": "elixir",
+"cost": 9000000,
+"source": "panel_probe",
+"at": "2026-11-21T17:05:13-05:00",
+"digits": "9000000",
+"up_btn": [
+1108,
+828
+],
+"n_cards": 3,
+"title_level": 6,
+"tap_dx": 0,
+"tap_dy": 45
+}
+}
