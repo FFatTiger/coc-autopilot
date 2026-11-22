@@ -1167,6 +1167,20 @@ function hhmm(ts){
   if (isNaN(d)) return '—';
   return `${pad2(d.getMonth()+1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
 }
+// 大号倒计时：一天以上用「1天2小时」，一天以内走钟表式秒级（18:59:12），
+// 这样每次截图都能看出它在走
+function fmtTick(sec){
+  if (sec === null || sec === undefined) return '—';
+  sec = Math.max(0, Math.round(sec));
+  if (sec >= 86400){
+    const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600);
+    return d + '天' + h + '小时';
+  }
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s2 = sec % 60;
+  const p2 = n => String(n).padStart(2, '0');
+  return h ? `${h}:${p2(m)}:${p2(s2)}` : `${m}:${p2(s2)}`;
+}
+
 function fmtLeft(sec){
   if (sec === null || sec === undefined) return '—';
   sec = Math.max(0, Math.round(sec));
@@ -1281,10 +1295,10 @@ function tickUpg(){
       big.textContent = '已完成';
       small.textContent = '等下一轮确认';
     } else if (remaining === null){
-      big.textContent = fmtLeft(elapsed);
+      big.textContent = fmtTick(elapsed);
       small.textContent = '已过 · 时长未知';
     } else {
-      big.textContent = fmtLeft(remaining);
+      big.textContent = fmtTick(remaining);
       small.textContent = '剩余';
     }
     const pct = row.querySelector('.pct');
