@@ -57,7 +57,6 @@ GRID_Y0, GRID_Y1 = 505, 1005        # 卡片区上下边界（OCR 只扫这一�
 ROW_Y = (712, 940)                  # 两行卡片「价格那一行」的 y 中心
 X_CLOSE = (1755, 64)                # 研究弹窗右上角红 X（实测 bbox x1716-1793 y27-101）
 X_CLOSE_CONFIRM = (1846, 85)         # 研究确认页右上角红 X（bbox x1808-1885 y50-120）
-X_CLOSE_OLD = (1837, 70)             # 旧值：留在村庄里正好落在金币栏上的那个红点，别再用了
 SW_L, SW_R = (1500, 700, 600, 700, 250), (600, 700, 1500, 700, 250)   # 翻页左/右
 MAX_PAGES = 8
 LABEL_Y = 884                       # 底栏卡片图标/文字的点击 y
@@ -1147,13 +1146,6 @@ def run(auto, res, dry=False):
         except Exception:
             pass
         r.save_state()
-
-
-def _hours(txt):
-    if not txt:
-        return 0
-    m = TIME_RE.search(txt)
-    return (int(m.group(1) or 0) * 24 + int(m.group(2) or 0)) if m else 0
 
 
 # ---------------------------------------------------------------- CLI
