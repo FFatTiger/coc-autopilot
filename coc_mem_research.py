@@ -304,6 +304,42 @@ def find_lab_template(im, min_score=0.70):
     return best if best and best[3] >= min_score else None
 
 
+def fix_calib_from_template(bld, T=None, im=None, min_score=0.70):
+    """用实验室贴图把镜头平移量反解出来并写回标定 → 新 T 或 None
+
+    干什么用：游戏会自己推镜头（开始研究/施工、弹商店、切页面回来都会），而村庄锚点贴图
+    一旦不在画面里，`calibrate()` 就只能退回上一次的缓存坐标。缓存一旦过期，采集点、
+    升级点击、实验室点击**全部**开始点偏（实测采集点偏了 100px，点到隔壁实验室上）。
+    实验室贴图是常驻的，认到它就能算出平移量，顺手把标定修回去。
+    """
+    im = im if im is not None else mem.grab()
+    hit = find_lab_template(im, min_score=min_score)
+    if not hit:
+        return None
+    mx, my, sc, score = hit
+    try:
+        s_cap = float((jload(LAB_TMPL_META, {}) or {}).get("s_capture") or 1.0)
+    except Exception:
+        s_cap = 1.0
+    s_new = s_cap * sc
+    try:
+        rows = bld.snapshot()
+    except Exception:
+        return None
+    lab = [r for r in rows if r["name"] == "Laboratory" and r["village"] == "home"]
+    if not lab:
+        return None
+    r = lab[0]
+    cx, cy = bld.to_calib(r["x"], r["y"])
+    dx, dy = bldlib.tap_off_of("Laboratory", bldlib.load_offsets())
+    tx, ty = (mx - s_new * cx) - dx, (my - s_new * cy) - dy
+    T = dict(s=round(s_new, 5), tx=round(tx, 2), ty=round(ty, 2),
+             matches=1, anchor_score=round(score, 3), via="lab_template",
+             at=int(time.time()))
+    mem.save_calib(T)
+    return T
+
+
 def is_village(im):
     """画面是不是「干净的村庄」：左上空地是草地（绿），且没有弹窗/建筑面板。
 
@@ -579,17 +615,12 @@ class Research:
             self.log("  [research] 镜头标定不可信，贴图也没找到实验室")
             return None
         mx, my, sc, score = hit
-        try:
-            s_cap = float((jload(LAB_TMPL_META, {}) or {}).get("s_capture") or 1.0)
-        except Exception:
-            s_cap = 1.0
-        s_new = s_cap * sc
-        cx, cy = self.bld.to_calib(r["x"], r["y"])
-        tx, ty = mx - s_new * cx, my - s_new * cy
-        self.tmpl_fix = dict(s=round(s_new, 5), tx=round(tx, 2), ty=round(ty, 2),
-                             score=round(score, 3), at=int(time.time()))
-        self.log("  [research] 贴图定位实验室 @(%d,%d) 分数 %.2f → 反解标定 "
-                 "s=%.4f tx=%.1f ty=%.1f" % (mx, my, score, s_new, tx, ty))
+        fixed = fix_calib_from_template(self.bld, T, im=self.grab())
+        self.tmpl_fix = fixed
+        if fixed:
+            self.log("  [research] 贴图定位实验室 @(%d,%d) 分数 %.2f → 修正标定 "
+                     "s=%.4f tx=%.1f ty=%.1f" % (mx, my, score, fixed["s"], fixed["tx"],
+                                                 fixed["ty"]))
         return (mx, my, "template")
 
     def open_lab_panel(self):

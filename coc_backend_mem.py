@@ -1147,15 +1147,23 @@ def apply_t(pts, T):
     return [(int(round(s * x + tx)), int(round(s * y + ty))) for (x, y) in pts]
 
 
+# 可以安全点击的「村庄画面」范围：右边这根 HUD（资源条 / 商店 / 宝石）和底部那条底栏
+# （战斗 / 建造 / 商店）都盖在世界上，点进去会开商城、礼包弹层甚至「联机模式」页
+# （实测：镜头被推到实验室那一屏时，4 个采集点落在 HUD 里，一轮下来一个资源没收着，
+#   还顺手开了两次礼包弹层、一次战斗页）。
+PLAY_AREA = (40, 120, 1780, 880)
+
+
 def collect_points(T=None, cal=None):
-    """17 个采集点换算到当前画面：可见的返回 (kind,x,y)，出屏的返回 (kind,x,y,'offscreen')。"""
+    """17 个采集点换算到当前画面：可见的返回 (kind,x,y)，出屏/落在 HUD 上的返回 (kind,x,y,'offscreen')。"""
     cal = cal or load_collectors()
     T = T or dict(s=1.0, tx=0.0, ty=0.0)
+    ax0, ay0, ax1, ay1 = PLAY_AREA
     out = []
     for k in ("gold", "elixir", "dark"):
         for (x, y) in cal["pairs"][k]:
             px, py = apply_t([(x, y)], T)[0]
-            if 6 <= px <= 2214 and 8 <= py <= 1072:
+            if ax0 <= px <= ax1 and ay0 <= py <= ay1:
                 out.append((k, px, py))
             else:
                 out.append((k, px, py, "offscreen"))
@@ -1253,6 +1261,18 @@ def collect(img=None, dry=False, cal=None, T=None):
                               "skip": "offscreen"})
                 continue
             k, x, y = item
+            # 采集前瞄一眼有没有挡屏弹层（礼包/商店）：有的话这一下就点在弹层上了，
+            # 而且点了还会把弹层再叫出来一次（实测「专属礼包」在采集途中反复冒出来，
+            # 一轮 12 个点全打空、资源一点没收到）
+            try:
+                import coc_mem_research as _r
+                _im = grab()
+                _p = _r.popup_x(_im) if _im is not None else None
+                if _p:
+                    log(f"  ⚠ 采集途中冒出来挡屏弹层 @{_p}，先关掉")
+                    shell().tap(*_p, wait=1.2)
+            except Exception:
+                pass
             shell().tap(x, y, wait=0.40)
             nxt = read_all() or cur
             d = nxt[k] - cur[k]

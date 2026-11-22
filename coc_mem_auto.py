@@ -500,6 +500,14 @@ class MemAuto:
                 return None
             pos = rsch.popup_x(im)
             if not pos:
+                # 再顺手确认没有建筑面板挡着（比如点到树上弹出的「移树」面板）：
+                # 有面板时采集点会点在面板上，一轮下来一个资源都收不到
+                pan = panel.read(im)
+                if pan.get("open") and pan.get("cards"):
+                    self.log("  先取消掉挡着的建筑面板（点空地）")
+                    mem.shell().tap(300, 700, wait=0.8)
+                    im = None
+                    continue
                 return im
             self.log(f"  关掉挡屏弹层 @{pos}")
             mem.shell().tap(*pos, wait=1.2)
@@ -562,7 +570,9 @@ class MemAuto:
 
         # 2.5) 先把挡屏的推广弹层关掉，不然下面的采集点和实验室点击全落在弹层上
         if not dry:
-            img = self.dismiss_modals(img) or img
+            _im = self.dismiss_modals(img)
+            if _im is not None:
+                img = _im
 
         # 3) 读资源（地址失效会自己重定位）
         res = self.read()
@@ -593,6 +603,21 @@ class MemAuto:
 
         # 4) 镜头自校正（锚点 + 气泡残差）
         T = mem.calibrate(img)
+        if (T or {}).get("via") in ("cached", "identity"):
+            # 缓存标定在镜头被游戏自己推走之后是错的（采集点会整体偏 100px 以上）。
+            # 用实验室贴图反解一次平移量，修好之后再往下走。
+            try:
+                import coc_mem_research as _rsch
+                fixed = _rsch.fix_calib_from_template(self.bld, T, im=img)
+            except Exception as e:
+                fixed = None
+                self.log(f"  [calib] 贴图修标定失败: {type(e).__name__}: {e}")
+            if fixed:
+                T = fixed
+                rec["calib_fixed"] = fixed
+                self.log("  [calib] 用实验室贴图修正镜头：s=%.4f tx=%.1f ty=%.1f（分数 %.2f）"
+                         % (fixed["s"], fixed["tx"], fixed["ty"],
+                            fixed.get("anchor_score") or 0))
         rec["calib"] = T
         if not T or T.get("via") in (None, "identity"):
             alerts.append("calib_identity")
