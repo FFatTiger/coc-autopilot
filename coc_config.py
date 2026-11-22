@@ -52,6 +52,13 @@ DEFAULTS = {
     "close_game_after_run": True,   # meta 落盘之后杀掉游戏（省屏幕、降温度）
     "lock_screen_after_run": True,  # 关游戏之后锁屏
 
+    # ---- 登录态巡检（coc_patrol_run.py --check-login）----
+    # 游戏干完就关是常态，所以「没进程」不算异常；只在下面这几个时间点往后
+    # login_check_window_min 分钟的窗口里，才把「游戏在跑但停在登录页/遮罩」当成问题报出来。
+    # 必须和 crontab 里那几次巡检对齐（crontab 写的是 EST 19/23/5/9 点 = 北京 8/12/18/22）。
+    "login_check_windows": ["08:00", "12:00", "18:00", "22:00"],
+    "login_check_window_min": 30,
+
     # 实验室 / 法术工厂里的「研究」（兵种 / 法术）——和「升级建筑本体」是两条路
     "research": True,                       # 是否自动研究
     "research_currency_priority": ["elixir", "dark", "gold"],
@@ -121,10 +128,24 @@ def _sanitize(d):
                       ("max_targets", 0, 5),
                       ("builders", 0, 10),
                       ("build_max_h", 0, 720),
-                      ("mem_cooldown_h", 0, 168)):
+                      ("mem_cooldown_h", 0, 168),
+                      ("login_check_window_min", 0, 240)):
         v = d.get(k)
         if isinstance(v, (int, float)) and lo <= v <= hi:
             out[k] = int(v)
+
+    wins = d.get("login_check_windows")
+    if isinstance(wins, list):
+        clean = []
+        for s in wins:
+            try:
+                hh, mm = str(s).strip().split(":")
+                hh, mm = int(hh), int(mm)
+                if 0 <= hh < 24 and 0 <= mm < 60:
+                    clean.append(f"{hh:02d}:{mm:02d}")
+            except Exception:
+                continue
+        out["login_check_windows"] = sorted(set(clean))
 
     cur = d.get("currency")
     if isinstance(cur, str) and cur.strip().lower() in CUR_CHOICES:

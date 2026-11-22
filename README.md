@@ -185,6 +185,55 @@ OCR 后端：每小时叫一次，脚本自己按 `config.json` 里的排期（�
 
 内存后端必须用装了 `rapidocr-onnxruntime` 的那个解释器（`requirements.txt` 里那套），它仍然复用 OCR 后端的面板守卫/进村逻辑。
 
+### 登录态巡检（`--check-login`）
+
+一轮干完就 `am force-stop` + 锁屏，所以**「游戏没在跑」是常态，不是异常**。
+登录检查因此做成项目里的一条独立入口，判据只有一份，别处不再实现第二遍：
+
+```sh
+cd /path/to/coc-autopilot
+.venv/bin/python coc_patrol_run.py --check-login      # 打一行 JSON，退出码 0=不用管 1=要人看
+```
+
+判据：
+
+| 情况 | state | 什么时候报 |
+|---|---|---|
+| 没进程（游戏关着） | — | **完全不输出**，退出码 0（一天 4 轮巡检，关着才是正常） |
+| 巡检正在跑 | `round_running` | 不报。它刚冷启动、正在重定位，这会儿读内存只会错报 |
+| 进程在但不在前台 | `not_foreground` | 不报（熄屏或用户切走了，不看画面） |
+| 游戏在跑却停在登录/授权页 | `login_page` | **任何时间都报**：说明有人动过手机，得用户本人登 |
+| 断线弹窗（还在吗／重新载入） | `reconnect` | 只在「应该跑」的窗口内报 |
+| 画面很暗（遮罩） | `dim_overlay` | 只在窗口内报 |
+| 没有地址 / 地址失效 / 读不到内存 | `no_state` / `addr_stale` / `memory_unreadable` | 只在窗口内报（冷启动后本来就会失效，下一轮自己会定位） |
+| 正常 | `ok` | 不报，但在 JSON 里带上读到的三项资源对账用 |
+
+「应该跑」的窗口 = `login_check_windows`（默认北京 08:00 / 12:00 / 18:00 / 22:00）每个点往后
+`login_check_window_min`（默认 30）分钟。**这两个值要和 crontab 里那几次巡检对齐**，改 cron 时一起改。
+
+画面判据不是另写一套 adb：用的是后端同名原语 `screen_kind()`（内存后端 = `village_probe`，
+OCR 后端 = `classify`），`pid_of()` 也是同一份实现，所以两种后端下判据一致。
+登录页只认具体关键词（`QQ登录` / `微信登录` / `用户协议` / `同意并继续` …），**从不点任何登录按钮**。
+
+定时怎么接（二选一，脚本都只有三行、不含任何判断逻辑）：
+
+```cron
+# crontab：每 30 分钟查一次，只有退出码非 0 才输出（= 触发提醒）
+*/30 * * * * cd /path/to/coc-autopilot && out=$(/path/to/.venv/bin/python coc_patrol_run.py --check-login 2>&1); [ $? -ne 0 ] && [ -n "$out" ] && printf '%s\n' "$out"
+```
+
+```sh
+# Hob 的「routine」检查脚本（30 分钟一次）也是同一个入口：
+cd /path/to/coc-autopilot || exit 0
+out=$(timeout 120 /path/to/.venv/bin/python coc_patrol_run.py --check-login 2>&1)
+rc=$?
+[ "$rc" -ne 0 ] && [ -n "$out" ] && printf '%s\n' "$out"
+exit 0
+```
+
+> 早期版本把这套判据写在一个独立小脚本里（`coc_proto/coc_login_guard.py`），已经弃用：
+> 它没有时间窗概念、会把「游戏关着」当故障（一天吵 48 次），读的还是另一份旧地址表。文件留作回滚参考，不要再调用。
+
 ### 配置
 
 页面右上角「设置」可以改，也可以直接编辑 `config.json`：

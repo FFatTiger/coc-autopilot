@@ -25,6 +25,8 @@
   python3 coc_patrol_run.py --dry                  # 只读不点：读数、采集点、升级候选、可研究对象
   python3 coc_patrol_run.py --if-due               # 给 cron 用，没到点就静默退出（仅 OCR 后端）
   python3 coc_patrol_run.py --backend memory --dry # 内存后端空跑一轮（迁代码/验证用）
+  python3 coc_patrol_run.py --check-login          # 只查登录态：没进程就静默退出，
+                                                   # 只在「应该跑」的窗口里把登录页/遮罩当问题报
 """
 import argparse
 import fcntl
@@ -55,14 +57,16 @@ def _on_alarm(signum, frame):
     raise RoundTimeout("一轮超过硬上限，看门狗强制收尾")
 
 
-def take_lock(path=LOCK_PATH):
+def take_lock(path=LOCK_PATH, probe=False):
     """抢一轮的排他锁。返回 (ok, 说明)。抢不到就打印跳过并退出 0。
+
+    probe=True 只探一下有没有人在跑（拿到就立刻放手，不占着）——登录态巡检用它：
+    巡检正在冷启动/定位时地址必然失效，这时候检查内存只会错报。
 
     为什么用 POSIX 记录锁（fcntl.lockf）而不只是 flock：cron 的外层 flock(1) 会把
     锁 fd 传给子进程，子进程再用 flock 抢同一个文件会**自己撞自己**（实测 EWOULDBLOCK），
     那就变成每次 cron 都跳过一轮。lockf 和 flock 是两套互不相干的锁，不会打架；
-    外层 flock 继续负责 cron 之间的互斥，lockf 负责「手动跑 vs cron」互斥。
-    两边都用同一个锁文件，一 ps 就能看出是谁占着。
+    外层 flock 继续负责 cron 之间的互斥，lockf 负责「手动跑 vs cron vs 登录态巡检」互斥。
     """
     global _lock_fd
     try:
@@ -79,6 +83,9 @@ def take_lock(path=LOCK_PATH):
             pass
         os.close(fd)
         return False, f"另一轮在跑，跳过（pid {pe}）"
+    if probe:
+        os.close(fd)                     # 探测：立刻放手，绝挡住下一轮 cron
+        return True, "没人在跑"
     # 锁拿到了：把自己的 pid 写进去当提示（不写任何别的信息）
     try:
         os.ftruncate(fd, 0)
@@ -108,6 +115,9 @@ def parse_args(argv=None):
     ap.add_argument("--no-walls", dest="include_walls", action="store_false", default=None,
                     help="不升城墙")
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--check-login", dest="check_login", action="store_true",
+                    help="只查登录态，不干活：游戏关着就静默退出，只在应该跑的窗口内"
+                         "把「在跑却停在登录页/遮罩」当问题报（给每 30 分钟的 routine 用）")
     return ap.parse_args(argv)
 
 
@@ -123,13 +133,13 @@ if BACKEND == "memory":
                                  read_star, find_bubbles, collect_one, init_capture,
                                  close_capture, panel_open, clear_panels, open_build_list,
                                  read_build_list, upgrade_from_list, read_res_until, log,
-                                 PKG, ACT)
+                                 PKG, ACT, pid_of, screen_kind)
     _mem.set_budgets(CFG0)
 else:
     from coc_patrol2 import (sh, grab, enter_village, read_res_vote, read_workers, read_star,
                              find_bubbles, collect_one, init_capture, close_capture, panel_open,
                              clear_panels, open_build_list, read_build_list, upgrade_from_list,
-                             read_res_until, log, PKG, ACT)
+                             read_res_until, log, PKG, ACT, pid_of, screen_kind)
 
 # 每项读数的来源，写进 meta.json 给看板看
 if BACKEND == "memory":
@@ -186,10 +196,18 @@ def write_meta(run_dir, meta):
 
 
 def _sh_out(cmd, timeout=20):
-    """跑一条 adb shell，只要 stdout（两种后端的 sh() 签名一致）。"""
+    """跑一条 adb shell，只要 stdout 文本。
+
+    两个后端的 sh() 返回的 stdout 一个是 str（coc_patrol2 用了 text=True）、
+    一个是 bytes（coc_backend_mem 的 _adb 没给 text），这里统一成 str，
+    否则后面 `in` / `split()` 一碰就 TypeError。
+    """
     try:
         r = sh(cmd, timeout=timeout)
-        return (getattr(r, "stdout", "") or "").strip()
+        out = getattr(r, "stdout", "") or ""
+        if isinstance(out, bytes):
+            out = out.decode("utf-8", "replace")
+        return out.strip()
     except Exception:
         return ""
 
@@ -200,6 +218,161 @@ def game_pid():
         if tok.isdigit():
             return int(tok)
     return None
+
+
+# ---------------------------------------------------------------- 登录态巡检
+# 一轮干完就 force-stop + 锁屏，所以「没进程」是常态，不是异常。
+# 判据（与 routine 无关，只在这里实现一份）：
+#   no_process               → 静默退出（退出码 0，一行都不输出）
+#   round_running            → 巡检正在跑，不插手（冷启动后地址必然失效，检查只会错报）
+#   not_foreground           → 游戏进程在但不在前台（熄屏/用户切走了），不报
+#   login_page               → **任何时间都报**：游戏在跑却停在登录/授权页 = 有人动过手机
+#   reconnect / dim_overlay  → 只在「应该跑」的窗口内报（窗内说明这一轮可能卡住了）
+#   no_state / addr_stale    → 只在窗口内报（地址失效是巡检自己的事，冷启动后本来就会失效）
+LOGIN_WORDS = ("QQ登录", "微信登录", "用户协议", "隐私政策", "同意并继续",
+               "实名认证", "切换账号", "授权登录", "登录游戏", "游客登录")
+DIM_OVERLAY = 60.0        # 画面平均亮度低于这个 = 有遮罩 / 没画面
+
+
+def beijing_now():
+    """北京时间。cron 写在系统时区（EST），窗口判断必须换算成北京。"""
+    import datetime
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.datetime.now(ZoneInfo("Asia/Shanghai"))
+    except Exception:
+        return datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+
+
+def login_window(cfg, now=None):
+    """(是否在应该跑的窗口内, 窗口说明)。窗口 = login_check_windows 每个点往后 N 分钟。"""
+    now = now or beijing_now()
+    cur = now.hour * 60 + now.minute
+    span = int(cfg.get("login_check_window_min", 30) or 0)
+    hits = []
+    if span > 0:
+        for item in cfg.get("login_check_windows") or []:
+            try:
+                hh, mm = str(item).split(":")
+                start = int(hh) * 60 + int(mm)
+            except Exception:
+                continue
+            if start <= cur < start + span:
+                hits.append(item)
+    txt = now.strftime("%Y-%m-%d %H:%M")
+    return bool(hits), txt + ("（窗口 " + "/".join(hits) + "）" if hits else "（不在窗口）")
+
+
+def login_hit(text):
+    """文本里有没有登录 / 授权页的特征词。宁可漏报也别用泛词（游戏里也有含「登录」的提示）。"""
+    if not text:
+        return None
+    for w in LOGIN_WORDS:
+        if w in text:
+            return w
+    if "登录" in text and ("QQ" in text or "微信" in text):
+        return "登录+QQ/微信"
+    return None
+
+
+def _emit(out, t0):
+    out["sec"] = round(time.time() - t0, 1)
+    print(json.dumps(out, ensure_ascii=False), flush=True)
+
+
+def check_login(cfg):
+    """登录态巡检（--check-login）。返回退出码：0 = 不用管，1 = 需要人看。
+
+    只读不写：不动游戏、不点任何东西、不做定位，也不改 coc_state.json。
+    """
+    t0 = time.time()
+    in_win, win_txt = login_window(cfg)
+    out = dict(ts=time.strftime("%Y-%m-%dT%H:%M:%S%z"), beijing=win_txt,
+               window=in_win, alert=False, state="ok", detail="", backend=BACKEND)
+
+    # 1) 巡检正在跑就退出：这时候它刚冷启动/正在定位，内存里读什么都是假的
+    got, why = take_lock(probe=True)
+    if not got:
+        out.update(state="round_running",
+                   detail="巡检正在跑（/tmp/coc_patrol.lock 被占），这会儿地址正在重定位，不插手")
+        _emit(out, t0)
+        return 0
+
+    # 2) 没进程 = 常态（每轮干完就关了），静默退出，连 JSON 都不打
+    try:
+        pid = pid_of()
+    except Exception:
+        pid = None
+    if not pid:
+        return 0
+    out["pid"] = pid
+
+    focus = _sh_out("dumpsys window | grep mCurrentFocus= | tail -2")
+    out["focus"] = (focus.replace("\n", " ")[:120] or None)
+    if PKG not in focus:
+        out.update(state="not_foreground",
+                   detail="进程在但不在前台（熄屏或用户切走了），不看画面")
+        _emit(out, t0)
+        return 0
+
+    # 3) 画面：登录页 / 断线遮罩 / 村庄（用后端同名原语，两边判据一致）
+    shot = {}
+    try:
+        shot = screen_kind() or {}
+    except Exception as e:
+        out["screen_error"] = f"{type(e).__name__}: {e}"
+    kind = shot.get("kind")
+    text = shot.get("text") or ""
+    bright = shot.get("brightness")
+    out.update(kind=kind, brightness=bright)
+    if text:
+        out["text"] = text[:300]
+
+    hit = login_hit(text)
+    if kind == "login" or hit:
+        out.update(state="login_page", alert=True,
+                   detail=f"画面命中登录/授权特征「{hit or 'login'}」，要用户本人登录，脚本不代登")
+        _emit(out, t0)
+        return 1
+    if kind == "reconnect":
+        out.update(state="reconnect", alert=in_win,
+                   detail="断线弹窗（还在吗／重新载入游戏）"
+                          + ("，窗口内要看" if in_win else "，窗口外不报"))
+        _emit(out, t0)
+        return 1 if in_win else 0
+    if bright is not None and bright < DIM_OVERLAY:
+        out.update(state="dim_overlay", alert=in_win,
+                   detail=f"画面很暗（{bright}），可能是遮罩"
+                          + ("，窗口内要看" if in_win else "，窗口外不报"))
+        _emit(out, t0)
+        return 1 if in_win else 0
+
+    # 4) 内存地址：只有内存后端有这回事，失效只在窗口内算问题
+    if BACKEND == "memory" and _mem is not None:
+        st = _mem.load_state() or {}
+        if not st.get("gold"):
+            out.update(state="no_state", alert=in_win,
+                       detail="coc_state.json 里没有资源地址（冷启动后还没定位）"
+                              + ("，窗口内要看" if in_win else "，窗口外不报"))
+            _emit(out, t0)
+            return 1 if in_win else 0
+        vals = None
+        try:
+            vals = _mem.read_all(retries=0, allow_locate=False)
+        except Exception as e:
+            out["read_error"] = f"{type(e).__name__}: {e}"
+        if not vals:
+            out.update(state="addr_stale", alert=in_win,
+                       detail="当前地址读不出合法资源（pid 变了或地址失效）"
+                              + ("，窗口内要看" if in_win else "，窗口外不报"))
+            _emit(out, t0)
+            return 1 if in_win else 0
+        out["vals"] = vals
+
+    out.update(state="ok",
+               detail="游戏在村庄，读数正常" if out.get("vals") else "画面正常（游戏在村庄）")
+    _emit(out, t0)
+    return 0
 
 
 def shutdown_round(cfg):
@@ -449,6 +622,9 @@ def main():
         if v is not None:
             cfg[key] = v
     dry = ARGS.dry
+
+    if ARGS.check_login:              # 登录态巡检：不进目录、不抢锁（自己探一下就放手）
+        return check_login(cfg)
 
     # 抢锁：手动跑和 cron 跑共用同一把锁，抢不到就干净退出（不进目录、不碰手机）
     got, why = take_lock()

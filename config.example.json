@@ -28,6 +28,10 @@
   "locate_total_s": 300,
   "round_max_s": 600,
 
+  "_登录态检查说明": "coc_patrol_run.py --check-login 用：游戏干完就关是常态，所以「没进程」一律静默；只在 login_check_windows 每个时间点往后 login_check_window_min 分钟的窗口里，才把「游戏在跑却停在登录页/遮罩/地址失效」当问题报出来。这几个时间点必须和 crontab 里那 4 次巡检对齐（crontab 写的是系统时区的 19/23/5/9 点 = 北京 8/12/18/22）。任何时间出现 login_page 都会报（说明有人动过手机）。",
+  "login_check_windows": ["08:00", "12:00", "18:00", "22:00"],
+  "login_check_window_min": 30,
+
   "_币种说明": "单次花费上限按币种分别设，宝石永远不参与（代码里没有宝石分支）。upgrade_currency_priority 决定先花哪种资源：圣水满仓会浪费所以排第一，暗黑量少排第二（只够便宜档），金币还在自然增长排最后。",
   "max_cost_gold": 3000000,
   "max_cost_elixir": 6000000,

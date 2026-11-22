@@ -283,6 +283,37 @@ def find_bubbles(img):
     return dedup
 
 
+# ---------------- 登录态巡检用的原语（内存后端同名，coc_patrol_run --check-login 两边都用） ----------------
+def pid_of():
+    """游戏进程还在不在。用 pidof 而不是 ps|grep：后者会把自己的 shell 和 grep 也算进去。"""
+    try:
+        out = sh(f"pidof {PKG}", timeout=15).stdout or ""
+    except Exception:
+        return None
+    for tok in out.split():
+        if tok.isdigit():
+            return int(tok)
+    return None
+
+
+def screen_kind(img=None):
+    """给「登录态巡检」用的统一画面判据。返回 dict(kind, text, brightness)。
+
+    这里只读不点、不截图落盘、不定位：检查登录态时不去动游戏。
+    """
+    if img is None:
+        img = grab()
+    bright = None
+    if img is not None:
+        try:
+            bright = round(float(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).mean()), 1)
+        except Exception:
+            bright = None
+    tx = ocr_all(img) if img is not None else []
+    return dict(kind=classify(tx), brightness=bright,
+                text=" ".join(t.get("t", "") for t in tx))
+
+
 # ---------------- 进村 ----------------
 LOADING = ("正在载入", "载入游戏", "正在加载")
 # 断线框的文案。必须比 LOADING 先判：「重新载入游戏」里包含「载入游戏」，

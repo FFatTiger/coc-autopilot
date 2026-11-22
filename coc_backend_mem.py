@@ -472,6 +472,25 @@ def village_probe(img=None):
     return _ocr.classify(tx), joined
 
 
+def screen_kind(img=None):
+    """给「登录态巡检」用的统一画面判据（两个后端同名同签名）。
+
+    返回 dict(kind, text, brightness)：
+      kind ∈ village / loading / reconnect / login / ad / popup / quit_confirm / panel / unknown / noimg
+    这里只读不点，也不做定位：检查登录态时绝不能去 relocate（那是巡检的活）。
+    """
+    if img is None:
+        img = grab()
+    bright = None
+    if img is not None:
+        try:
+            bright = round(float(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).mean()), 1)
+        except Exception:
+            bright = None
+    kind, joined = village_probe(img)
+    return dict(kind=kind, text=joined, brightness=bright)
+
+
 def cold_start(wait=None, launch=True):
     """一轮的开始：唤醒解锁 → 没跑就拉起 → 轮询等进村 → 断线框点「重新载入游戏」。
 
