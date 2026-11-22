@@ -121,11 +121,8 @@
 "Gold Mine|14": {
 "currency": "elixir",
 "cost": 1200000,
-"source": "panel_probe",
-"at": "2026-11-21T16:53:16-05:00",
-"verified_level": 14,
-"shot": "work/probe_Gold_Mine.png",
-"note": "面板价 + 圣水图标（金币↔圣水 交叉）"
+"source": "upgrade_delta",
+"at": "2026-11-22 05:45:49"
 },
 "Gold Storage|13": {
 "currency": "elixir",
@@ -206,18 +203,9 @@
 },
 "Dark Elixir Drill|5": {
 "currency": "elixir",
-"cost": 800000,
-"source": "panel_probe",
-"at": "2026-11-21T17:04:45-05:00",
-"digits": "800000",
-"up_btn": [
-1202,
-884
-],
-"n_cards": 4,
-"title_level": 5,
-"tap_dx": 0,
-"tap_dy": 45
+"cost": 1800000,
+"source": "upgrade_delta",
+"at": "2026-11-22 05:45:27"
 },
 "Spell Factory|6": {
 "currency": "elixir",

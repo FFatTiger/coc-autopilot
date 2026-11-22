@@ -172,6 +172,27 @@ class Buildings:
         self._price_cache = self._load_prices()
 
     # ---------------- 基础 ----------------
+    def _sync_pid(self):
+        """把 pid / 映射表 / 类型缓存对齐到「现在活着的那个进程」。
+
+        冷启动（杀掉再拉起）之后 pid 一定变：缓存的 maps 是上一个进程的，甚至可能是
+        空的（进程还没起来时就构造了 Buildings），于是 libg 基址是 None，
+        后面 `libg_base() + 偏移` 直接抛 `NoneType + int`（实测就这样整轮枚举失败）。
+        """
+        try:
+            pid = mem.find_pid()
+        except Exception:
+            pid = None
+        if pid and pid != self.pid:
+            self.log(f"[池] 进程变了 → {pid}，映射表/池/类型缓存全部作废")
+            self.pid = pid
+            self.s.pid = pid
+            self._maps = None
+            self._libg = None
+            self._types = {}
+            self._pool = None
+        return self.pid
+
     def maps(self, fresh=False):
         if self._maps is None or fresh:
             self._maps = mem.maps_raw(self.pid)
@@ -179,19 +200,24 @@ class Buildings:
 
     def libg_base(self):
         if self._libg is None:
-            for r in self.maps():
-                if r["name"].endswith("libg.so") and r["off"] == 0:
-                    self._libg = r["start"]
+            for fresh in (False, True):      # 空表/旧表：重拓一次映射表再试
+                for r in self.maps(fresh=fresh):
+                    if r["name"].endswith("libg.so") and r["off"] == 0:
+                        self._libg = r["start"]
+                        break
+                if self._libg is not None:
                     break
         return self._libg
 
     def vt_range(self):
-        b = self.libg_base()
+        b = self.libg_base() or 0
         off, sz = DATA_REL_RO
         return b + off, b + off + sz
 
     def vt_building(self):
-        return self.libg_base() + VT_OFF_BUILDING
+        # 拿不到 libg 基址时返回一个小值，让 locate() 的 `vt < 0x1000` 拦住并写日志，
+        # 不抱 `None + int` 的 TypeError 上去（那种报错看不出真正原因）
+        return (self.libg_base() or 0) + VT_OFF_BUILDING
 
     def read(self, va, size):
         """读一段内存（走常驻 root shell，base64 传回）。失败返回 b""
@@ -310,11 +336,13 @@ class Buildings:
         """
         if self._pool and not force:
             return self._pool
+        self._sync_pid()                     # 冷启动后 pid/maps 必须先对齐
         st = self._state()
-        vt = self.vt_building()
-        if not vt or vt < 0x1000:
-            self.log("[池] 拿不到 libg 基址")
+        libg = self.libg_base()
+        if not self.pid or not libg:
+            self.log("[池] 拿不到 libg 基址（进程没起来或刚重启）")
             return None
+        vt = libg + VT_OFF_BUILDING
         # tier0: 缓存地址
         if not force and st.get("base") and st.get("libg") == self.libg_base():
             base = int(st["base"])

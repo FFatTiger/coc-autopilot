@@ -40,6 +40,18 @@ DEFAULTS = {
     # 先花哪种资源：圣水满仓会浪费，所以排第一；暗黑量少排第二（只够便宜档）
     "upgrade_currency_priority": ["elixir", "dark", "gold"],
 
+    # ---- 一轮的开始 / 结束（「开机—干活—关机」闭环）----
+    # 每轮冷启动游戏：不跑就拉起、等进村、断线框点重新载入。冷启动后地址必然失效，
+    # 走完整定位（上一轮读数精确搜 → 画面读数当种子 → 结构兜底），所以单轮会从 50s
+    # 涨到 3~5 分钟。
+    "cold_start": True,
+    "village_wait_s": 120,      # 冷启动后等进村的上限（画面判断，到点就放弃这一轮）
+    "locate_stage_s": 180,      # 单级定位（精确 / 宽窗 / 结构兜底）的时限
+    "locate_total_s": 300,      # 整轮定位的总时限，超了就放弃这一轮并写 alert
+    "round_max_s": 600,         # 一轮的硬上限（看门狗）：到点也走收尾，绝不允许无限跑
+    "close_game_after_run": True,   # meta 落盘之后杀掉游戏（省屏幕、降温度）
+    "lock_screen_after_run": True,  # 关游戏之后锁屏
+
     # 实验室 / 法术工厂里的「研究」（兵种 / 法术）——和「升级建筑本体」是两条路
     "research": True,                       # 是否自动研究
     "research_currency_priority": ["elixir", "dark", "gold"],
@@ -52,7 +64,11 @@ DEFAULTS = {
 KIND_CHOICES = ("gold", "elixir", "dark")
 BACKEND_CHOICES = ("ocr", "memory")
 CUR_CHOICES = ("gold", "elixir", "dark", "any")
-COST_KEYS = (("max_cost_gold", 0, 50_000_000),
+COST_KEYS = (("village_wait_s", 10, 600),
+             ("locate_stage_s", 5, 900),
+             ("locate_total_s", 5, 1800),
+             ("round_max_s", 0, 3600),
+             ("max_cost_gold", 0, 50_000_000),
              ("max_cost_elixir", 0, 50_000_000),
              ("max_cost_dark", 0, 10_000_000),
              ("research_min_gap_min", 0, 1440),
@@ -79,7 +95,8 @@ def _sanitize(d):
         out["schedule"] = sorted(set(clean))
 
     for k in ("collect", "upgrade", "include_walls", "include_bb", "research",
-              "research_alternate"):
+              "research_alternate", "cold_start", "close_game_after_run",
+              "lock_screen_after_run"):
         if isinstance(d.get(k), bool):
             out[k] = d[k]
 

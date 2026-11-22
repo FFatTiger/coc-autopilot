@@ -21,7 +21,13 @@
 
 手动用法:
   python3 coc_backend_mem.py read                # 读一次资源（地址没了会自动 locate）
-  python3 coc_backend_mem.py locate              # 强制重定位
+  python3 coc_backend_mem.py locate              # 强制重定位（带时间上限）
+  python3 coc_backend_mem.py cold                # 一轮开头：唤醒解锁 → 拉起 → 等进村
+  python3 coc_backend_mem.py village             # 只判一下当前是什么画面
+  python3 coc_backend_mem.py close               # 杀游戏并回读 pidof 确认
+  python3 coc_backend_mem.py sleep               # 锁屏并回读 dumpsys 确认
+  python3 coc_backend_mem.py power               # 打印 mWakefulness / Display Power
+  python3 coc_backend_mem.py shutdown            # 收尾：关游戏 + 锁屏
   python3 coc_backend_mem.py calib               # 解一次镜头变换并打印
   python3 coc_backend_mem.py collect --dry       # 走一遍 17 个采集点，不点击
   python3 coc_backend_mem.py collect             # 真收一轮（点气泡 + dismiss）
@@ -79,6 +85,11 @@ if not SERIAL:
 # 全被挡住。它不在 coc_patrol2.classify() 认识的弹窗里，内存后端自己收一道。
 PROMO_WORDS = ("前往查看", "公共频道", "城镇广场", "欢迎来到")
 PROMO_CLOSE = (1938, 120)      # 弹层右上角的 X，和 coc_patrol2.AD_CLOSE 是同一个点
+RELOAD_BTN = (1105, 926)       # 断线弹窗的「重新载入游戏」（UI 固定坐标，不随镜头变）
+
+# 掉到登录页就得停手：QQ / 微信授权只能用户本人做，脚本绝不尝试自己登。
+LOGIN_WORDS = ("QQ登录", "微信登录", "授权登录", "登录游戏", "切换账号",
+               "游客登录", "实名认证", "同意并继续")
 
 # coc_patrol2.grab() 里用到的模块级计数器 _mc_fail 只在一帧成功取回之后才会被赋值，
 # minicap 起不来时第一次 grab 会抛 NameError。这里先把它补齐：内存后端不能因为
@@ -95,7 +106,32 @@ MARK = "__COC_MEM__"
 PAGE = 4096
 BLK = 8 << 20            # 重定位时每块读 8MB
 DD_TIMEOUT = 8           # 手机端 timeout：读到未映射页会永久阻塞，必须让远端自己超时
-SCAN_BUDGET = 300        # 单个搜索模式的墙钟预算（秒）
+SCAN_BUDGET = 300        # 没给 deadline 时的单次搜索预算（秒，兜底用）
+
+# ---- 时间预算：这四项由 coc_config 覆盖（village_wait_s / locate_stage_s /
+# locate_total_s / round_max_s），默认值和配置默认值一致。定位是最容易卡住的一步：
+# 三级搜索（精确 → 宽窗 → 结构兜底）如果每一级都跑到底，实测能烧掉十分钟以上。
+# 所以每级加时限、整轮再加一个总时限，到点就放弃这一轮，绝不无限跑。
+VILLAGE_WAIT = 120       # 冷启动后等进村的上限
+LOCATE_STAGE = 180       # 单级定位的墙钟上限
+LOCATE_TOTAL = 300       # 整轮定位的上限
+ROUND_MAX = 600          # 一轮的硬上限（给 coc_patrol_run 的看门狗用）
+
+# 最近一次 relocate() 的结果（给 meta.json 看「为什么没定上位置」）
+LOCATE_INFO = {}
+_STEPS = []
+
+
+def set_budgets(cfg=None):
+    """把 config 里的时间预算应用到模块常量。返回生效的四元组（方便写日志）。"""
+    global VILLAGE_WAIT, LOCATE_STAGE, LOCATE_TOTAL, ROUND_MAX
+    cfg = cfg or {}
+    for name in ("VILLAGE_WAIT", "LOCATE_STAGE", "LOCATE_TOTAL", "ROUND_MAX"):
+        v = cfg.get(name.lower())
+        if isinstance(v, (int, float)) and v > 0:
+            globals()[name] = int(v)
+    return dict(village_wait_s=VILLAGE_WAIT, locate_stage_s=LOCATE_STAGE,
+                locate_total_s=LOCATE_TOTAL, round_max_s=ROUND_MAX)
 
 # 重定位只扫这几类段：实测资源结构在 libc_malloc 里；其余段命中率低还费时间
 SKIP_NAME = ("dalvik", "jit", "ashmem", "dev/", ".so", ".oat", ".vdex", ".art",
@@ -107,6 +143,23 @@ def _adb(args, timeout=30, **kw):
     cmd = ["adb"] + (["-s", SERIAL] if SERIAL else []) + list(args)
     kw.setdefault("capture_output", True)
     return subprocess.run(cmd, timeout=timeout, **kw)
+
+
+def _shx(cmd, timeout=20):
+    """跑一条 adb shell（shell 用户，不走常驻 root shell）。
+
+    ⚠ `am` / `wm` / `monkey` 绝对不能走常驻 root shell：su 域里调这几个会报
+    「Failure calling service activity: Failed transaction (2147483646)」——
+    命令返回码 0、看起来执行了，实际一件事都没做（force-stop 尤其致命：
+    游戏一直挂着，屏幕亮一晚上）。实测只有 shell 用户才能正常 force-stop。
+    读内存/点击（input）用 root shell 没问题，这两类继续走 shell()。
+    """
+    try:
+        r = _adb(["shell", cmd], timeout=timeout, text=True)
+        return (r.stdout or "").strip()
+    except Exception as e:
+        log(f"  adb shell 失败（{cmd[:40]}）：{type(e).__name__}: {e}")
+        return ""
 
 
 def find_pid():
@@ -256,9 +309,78 @@ def close():
 
 
 # ---------------------------------------------------------------- 屏幕 / 前台
+def power_state():
+    """亮屏/熄屏状态：mWakefulness=Awake/Asleep/Dozing + Display Power: state=ON/OFF。"""
+    txt = _shx('dumpsys power | grep -E "mWakefulness=|Display Power"', timeout=15)
+    wake, disp = None, None
+    for line in txt.splitlines():
+        line = line.strip()
+        if "mWakefulness=" in line and "Changing" not in line:
+            wake = line.split("mWakefulness=", 1)[1].strip()
+        if "Display Power" in line:
+            disp = line.split("state=", 1)[1].strip() if "state=" in line else line
+    return dict(wakefulness=wake, display=disp,
+                awake=(wake == "Awake"), asleep=(wake in ("Asleep", "Dozing")),
+                raw=" | ".join(l.strip() for l in txt.splitlines() if l.strip())[:200])
+
+
 def awake():
     """屏幕是不是亮着（KEYCODE_SLEEP 之后 dumpsys 里是 Asleep/Dozing）。"""
-    return "Awake" in shell().run("dumpsys power | grep -m1 mWakefulness=")
+    return power_state()["awake"]
+
+
+def keyguard_shown():
+    """锁屏还在不在。返回 True / False / None（这版 ROM 里看不到判据）。
+
+    唤醒 ≠ 回到 App：实测设了 stayon 也会因为系统超时熄屏，唤醒后停在滑动锁屏上，
+    那一帧上认什么都没用。所以锁屏必须单独判、单独解，不能靠“亮度够了”就以为回到村庄。
+    """
+    out = _shx("dumpsys window | grep -E "
+               "'mShowingLockscreen=|mDreamingLockscreen=|isStatusBarKeyguard='",
+               timeout=15).lower()
+    # 实测这版 ROM 打的是 isStatusBarKeyguard=true/false（不是 isShown），
+    # 两个都认，免得刷机/升级后默默退化成「永远判不出来」
+    if ("isstatusbarkeyguard=true" in out or "isshown=true" in out
+            or "mshowinglockscreen=true" in out or "mdreaminglockscreen=true" in out):
+        return True
+    if ("isstatusbarkeyguard=false" in out or "isshown=false" in out
+            or "mshowinglockscreen=false" in out):
+        return False
+    return None
+
+
+def wake_unlock():
+    """点亮屏幕 + 解锁。返回 {awake, woke, keyguard, unlock, taps}。
+
+    顺序：KEYCODE_WAKEUP → wm dismiss-keyguard → 还停在锁屏就上滑一次再来。
+    上滑坐标取屏幕中下部（2220×1080）到中上部，速度要快（200ms），慢了会被当成长按。
+    """
+    s = shell()
+    out = dict(woke=False, awake=False, keyguard=None, unlock=None, taps=0)
+    if not awake():
+        _shx("input keyevent KEYCODE_WAKEUP", timeout=15)
+        out["woke"] = True
+        time.sleep(1.0)
+    out["awake"] = awake()
+    if not out["awake"]:
+        return out
+    out["keyguard"] = keyguard_shown()
+    for _ in range(2):
+        # wm 走 shell 用户：root 域里调 wm 会 Failed transaction，锁屏根本解不开
+        _shx("wm dismiss-keyguard", timeout=15)
+        time.sleep(0.9)
+        kg = keyguard_shown()
+        out["keyguard"] = kg
+        if kg is False or PKG in focus():
+            break
+        _shx("input swipe 1110 900 1110 300 200", timeout=15)   # 上滑解锁
+        out["taps"] += 1
+        time.sleep(0.9)
+    out["unlock"] = (keyguard_shown() is not True)
+    out["awake"] = awake()
+    log(f"  屏幕 wake={out['woke']} awake={out['awake']} keyguard={out['keyguard']} "
+        f"unlock={out['unlock']}")
+    return out
 
 
 def focus():
@@ -273,8 +395,8 @@ def focus():
 def ensure_ready():
     """确保 屏幕亮 + 游戏在前台 + pid 有效。返回 (changed, [原因])。
 
-    和 OCR 后端「每轮 force-stop 重开游戏」不同：内存后端要靠游戏进程长期活着，
-    地址才能一直有效（重开一次就要重新定位一两分钟）。所以这里只补缺失的那一项。
+    只做「补缺失的那一项」，不重启游戏（老接口，保留给不想冷启动的场景）。
+    需要完整的「唤醒→解锁→拉起→等进村」时用 start_round()。
     """
     s = shell()
     reasons = []
@@ -283,7 +405,10 @@ def ensure_ready():
         time.sleep(0.9)
         reasons.append("wakeup")
     if PKG not in focus():
-        s.run(f"am start -n {PKG}/{ACT}")
+        if keyguard_shown():
+            wake_unlock()
+            reasons.append("unlock")
+        _shx(f"am start -n {PKG}/{ACT}", timeout=20)
         time.sleep(3.5)
         reasons.append("relaunch")
     if not s.alive():
@@ -293,6 +418,241 @@ def ensure_ready():
             raise RuntimeError(f"游戏进程不在，也拉不起来：{e}")
         reasons.append("pid=%d" % s.pid)
     return bool(reasons), reasons
+
+
+# ---------------------------------------------------------------- 一轮的开始 / 结束
+def pid_of():
+    """游戏进程还在不在（force-stop 之后要能确认它真的退了）。
+
+    用 pidof 而不是 ps|grep：后者会把自己的 shell 和 grep 也算进去。
+    """
+    try:
+        out = _adb(["shell", f"pidof {PKG}"], timeout=15, text=True).stdout.strip()
+    except Exception:
+        return None
+    for tok in out.split():
+        if tok.isdigit():
+            return int(tok)
+    return None
+
+
+def login_page(joined):
+    """画面里是不是登录 / 授权页。命中就不碰，直接放弃这一轮（QQ/微信只能用户本人登）。"""
+    if not joined:
+        return False
+    if any(w in joined for w in LOGIN_WORDS):
+        return True
+    return "登录" in joined and ("QQ" in joined or "微信" in joined)
+
+
+def village_probe(img=None):
+    """画面里是什么。返回 (kind, joined_text)，kind ∈ village/loading/reconnect/login/
+    ad/popup/quit_confirm/panel/unknown/noimg。
+
+    判据直接用 coc_patrol2 的 classify（底栏「建造/战斗」+ 右上角 5 位数字 = 资源条），
+    它已经在 OCR 后端跑了很久；这里只把它的结论翻译成「该等 / 该点 / 该放弃」。
+    """
+    if img is None:
+        img = grab()
+    if img is None:
+        return "noimg", ""
+    try:
+        mean = float(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).mean())
+    except Exception:
+        mean = 0.0
+    try:
+        tx = _ocr.ocr_all(img)
+    except Exception:
+        tx = []
+    joined = " ".join(t.get("t", "") for t in tx)
+    if login_page(joined):
+        return "login", joined
+    if mean < 45 and not any(len(t.get("t", "")) >= 2 for t in tx):
+        return "loading", joined          # 全黑的载入页：不浪费 OCR/点击，接着等
+    return _ocr.classify(tx), joined
+
+
+def cold_start(wait=None, launch=True):
+    """一轮的开始：唤醒解锁 → 没跑就拉起 → 轮询等进村 → 断线框点「重新载入游戏」。
+
+    返回 dict(ok, mode, woke, unlocked, launched, pid, waited, via, steps, error)
+
+    为什么不等固定秒数：刚拉起的游戏 18~40s 才进村（看机器忙不忙），死等 25s 要么白等
+    要么早读；这里按画面判（村庄锚点 / 资源条读得出来），进村就往下走，最多等
+    VILLAGE_WAIT 秒，到点就交回失败——绝不能把一轮拖成无限长。
+
+    红线：掉到 QQ/微信 登录页就写 alert 退出，绝不自己登。
+    """
+    t0 = time.time()
+    wait = float(wait or VILLAGE_WAIT)
+    out = dict(ok=False, mode=None, woke=False, unlocked=None, launched=False,
+               pid=None, waited=0.0, via=None, steps=[], error=None)
+
+    w = wake_unlock()
+    out["woke"], out["unlocked"] = w.get("woke"), w.get("unlock")
+    if not w.get("awake"):
+        out["error"] = "screen_off（唤醒后屏幕仍是熄的）"
+        return out
+
+    pid = pid_of()
+    if pid:
+        # 进程还在（上一轮异常没关成、或用户自己开着）：只叫到前台，不重启、不等进村，
+        # 地址可能还有效，省一次两三分钟的定位。
+        out["mode"] = "warm"
+        out["pid"] = pid
+        shell().pid = pid
+        if PKG not in focus():
+            _shx(f"am start -n {PKG}/{ACT}", timeout=20)
+            out["steps"].append("bring_to_front")
+            time.sleep(3.0)
+        out["ok"] = True
+        out["via"] = "running"
+        out["waited"] = round(time.time() - t0, 1)
+        log(f"  游戏已在跑（pid {pid}），只切换到前台（{out['waited']}s）")
+        return out
+
+    out["mode"] = "cold"
+    if not launch:
+        out["error"] = "game_not_running"
+        return out
+
+    log("  冷启动：拉起游戏")
+    res = _shx(f"monkey -p {PKG} -c android.intent.category.LAUNCHER 1", timeout=25)
+    out["launch_out"] = res[:120]
+    out["launched"] = True
+    out["steps"].append("launch")
+    for _ in range(15):                      # 等进程起来，最多 15s
+        time.sleep(1.0)
+        pid = pid_of()
+        if pid:
+            break
+    if not pid:
+        out["error"] = "launch_failed（monkey 拉起后也没有进程）"
+        return out
+    out["pid"] = pid
+    shell().pid = pid
+
+    # 轮询等进村：画面说了算，最多 VILLAGE_WAIT 秒
+    deadline = time.time() + wait
+    reloads = 0
+    last_kind = None
+    while time.time() < deadline:
+        kind, joined = village_probe()
+        last_kind = kind
+        left = deadline - time.time()
+        if kind == "village":
+            time.sleep(0.8)                  # 进村那一两秒数字还在滚动，稳一下
+            kind2, _ = village_probe()
+            if kind2 == "village":
+                out["ok"] = True
+                out["via"] = "village"
+                break
+            continue
+        if kind == "login":
+            out["error"] = "login_page（掉到登录/授权页，停手等人工处理）"
+            out["steps"].append("login")
+            log(f"  ⚠ 画面出现登录页：{joined[:80]}")
+            break
+        if kind == "reconnect":
+            if reloads >= 3:
+                out["error"] = "reconnect_loop（连点 3 次重新载入还是断线）"
+                break
+            log(f"  断线弹窗，点「重新载入游戏」@{RELOAD_BTN}")
+            shell().tap(*RELOAD_BTN, wait=1.5)
+            reloads += 1
+            out["steps"].append("reload")
+            deadline = time.time() + wait        # 重载要重新计时（但总时长仍有看门狗）
+            time.sleep(6.0)
+            continue
+        if kind in ("ad", "popup", "unknown", "panel"):
+            # 推广弹层 / 欢迎回来：dismiss_promo 有「压暗 + 命中推广文案」双判据，安全
+            try:
+                dismiss_promo()
+            except Exception:
+                pass
+        if left < 4:
+            break
+        time.sleep(2.0)
+
+    if not out["ok"] and not out["error"]:
+        out["error"] = f"village_timeout（{wait:.0f}s 内没进村，最后画面 {last_kind}）"
+    out["waited"] = round(time.time() - t0, 1)
+    log(f"  冷启动 {'成功' if out['ok'] else '失败'} {out['waited']}s via={out['via']} "
+        f"err={out['error']}")
+    return out
+
+
+def start_round(cold=True, wait=None):
+    """一轮开头的统一入口（取代老的 ensure_ready + enter_village 两步）。"""
+    out = cold_start(wait=wait, launch=True)
+    if not out["ok"] and out.get("mode") == "cold" and not cold:
+        out["error"] = out["error"] or "game_not_running"
+    if out["ok"] and out.get("mode") == "cold":
+        # 新进程 = 老地址一定失效。主动标记失效（保留 seed）比等 read_all 撞一遍快。
+        invalidate("cold_start")
+    return out
+
+
+def close_game(timeout=12):
+    """杀掉游戏，回读 pidof 确认真的退了。返回 dict(ok, pid, sec, out)。
+
+    force-stop 必须走 shell 用户（_shx）：root 域里调 am 会 Failed transaction，
+    看上去执行了实际什么也没做（实测游戏一直活着）。
+    """
+    t0 = time.time()
+    out_s = _shx(f"am force-stop {PKG}", timeout=25)
+    time.sleep(1.0)
+    pid = pid_of()
+    while pid and time.time() - t0 < timeout:
+        time.sleep(1.0)
+        pid = pid_of()
+    out = dict(ok=not pid, pid=pid, sec=round(time.time() - t0, 1), out=out_s[:120])
+    log(f"  关掉游戏 {'✓' if out['ok'] else '✗'}（{out['sec']}s，pid={pid}）")
+    return out
+
+
+def sleep_screen(tries=2):
+    """锁屏：KEYCODE_SLEEP 之后读 dumpsys 确认 mWakefulness=Asleep。
+
+    为什么要回读：stayon/svc power stayon true 这类设置会让「息屏」静默失效，
+    不读一遍 dumpsys 就不知道屏幕其实还亮着（那就是白烧一晚上屏幕）。
+    KEYCODE_SLEEP 不生效时用电源键 26 兜底。
+    """
+    t0 = time.time()
+    st = power_state()
+    for i in range(max(1, tries)):
+        key = "KEYCODE_SLEEP" if i == 0 else "26"
+        _shx(f"input keyevent {key}", timeout=15)
+        time.sleep(1.4)
+        st = power_state()
+        if st["asleep"]:
+            break
+    ok = bool(st["asleep"])
+    out = dict(ok=ok, wakefulness=st["wakefulness"], display=st["display"],
+               sec=round(time.time() - t0, 1))
+    log(f"  锁屏 {'✓' if ok else '✗'}（{out['wakefulness']} / Display {out['display']}）")
+    return out
+
+
+def shutdown(do_close=True, do_lock=True):
+    """一轮干完之后的收尾：杀游戏 + 锁屏。任何一步失败都不抛异常，只写日志。
+
+    调用时机很关键：必须在 meta.json 落盘之后（否则先杀游戏会导致截图/后读拿不到）。
+    """
+    out = dict(close=None, lock=None, ok=True)
+    if do_close:
+        try:
+            out["close"] = close_game()
+        except Exception as e:
+            out["close"] = dict(ok=False, error=f"{type(e).__name__}: {e}")
+        out["ok"] = out["ok"] and bool(out["close"].get("ok"))
+    if do_lock:
+        try:
+            out["lock"] = sleep_screen()
+        except Exception as e:
+            out["lock"] = dict(ok=False, error=f"{type(e).__name__}: {e}")
+        out["ok"] = out["ok"] and bool(out["lock"].get("ok"))
+    return out
 
 
 def screencap(path):
@@ -551,25 +911,36 @@ def _segments(pid, min_mb=4):
     return out
 
 
-def _pull_block(pid, addr, size):
-    """读一段内存到本地。<关键> 必须带手机端 timeout，否则未映射页会把 adb 通道堵死。"""
+def _pull_block(pid, addr, size, timeout=None):
+    """读一段内存到本地。<关键> 必须带手机端 timeout，否则未映射页会把 adb 通道堵死。
+
+    timeout 给了就把两条 adb 调用各自压到剩余时间以内：单块读卡住时最多拖掉
+    几十秒，不会把整轮定位的预算吃光（实测 dd 碰到坏页会把整块拖到超时）。
+
+    临时文件名带本进程 pid：两个进程同时扫内存时（手动跑 + cron 撞车），共用
+    /data/local/tmp/_cocscan.bin 会让双方都 pull 到别人写了一半的块，候选全变成垃圾。
+    """
     size = (size // PAGE) * PAGE or PAGE
     skip, cnt = addr // PAGE, size // PAGE
-    remote = f"/data/local/tmp/_cocscan.bin"
+    tag = os.getpid()
+    remote = f"/data/local/tmp/_cocscan_{tag}.bin"
+    local = f"/tmp/_cocscan_{tag}.bin"
+    sh_t = 25 if timeout is None else max(4, min(25, int(timeout)))
+    pull_t = 60 if timeout is None else max(4, min(60, int(timeout)))
     cmd = (f"timeout {DD_TIMEOUT} dd if=/proc/{pid}/mem of={remote} bs={PAGE} "
            f"skip={skip} count={cnt} 2>/dev/null; chmod 666 {remote}")
     try:
-        _adb(["shell", f"su -c {cmd!r}"], timeout=25)
+        _adb(["shell", f"su -c {cmd!r}"], timeout=sh_t)
     except subprocess.TimeoutExpired:
         return b""
     try:
-        r = _adb(["pull", remote, "/tmp/_cocscan.bin"], timeout=60)
+        r = _adb(["pull", remote, local], timeout=pull_t)
     except subprocess.TimeoutExpired:
         return b""
     if r.returncode != 0:
         return b""
     try:
-        with open("/tmp/_cocscan.bin", "rb") as f:
+        with open(local, "rb") as f:
             return f.read()
     except OSError:
         return b""
@@ -753,22 +1124,47 @@ def _hud_agree(v, spec, min_keys=2):
     return hit >= min_keys
 
 
-def _scan(pid, specs, spec_check, min_mb=4):
+def _checks_of(spec_check):
+    """spec_check 允许是「单个 spec」或「一组 spec」，统一成 list[spec]。
+
+    单个 spec 形如 [(值, 窗口) x3]；一组 spec 形如 [spec, spec]。
+    """
+    if not spec_check:
+        return [[]]
+    first = spec_check[0]
+    if isinstance(first, (list, tuple)) and first and isinstance(first[0], (list, tuple)):
+        return [list(c) for c in spec_check]
+    return [list(spec_check)]
+
+
+def _scan(pid, specs, spec_check, min_mb=4, deadline=None):
     """扫一遍内存，用所有搜索窗口同时匹配（省得每种模式各扫一遍，一次要一两分钟）。
 
     specs = [(mode, spec)]，列表顺序就是优先级。
-    spec_check 是最终验收用的窗口（含结构搜索的样本值）。
+    spec_check 是验收用的窗口，可以给一组（list of spec）：候选只要**对得上其中一组**
+    就收。为什么要给多组：画面 OCR 偶尔会把某一项读错（实测真值 1,413,829 读成 62,811），
+    拿单组窗口验收时所有正确候选都会被那个错值一票否决，整轮定位必然失败；
+    再拿上一轮存下的读数做一组备用窗口，就能绕开一次误读。
+    deadline（绝对时间戳）到了就停——这是防「一轮无限跑」的第一道闸。
     """
+    checks = _checks_of(spec_check)
     segs = _segments(pid, min_mb)
     total = sum(x["size"] for x in segs)
     log(f"  重定位 扫 {len(segs)} 段 / {total / 1048576:.0f}MB "
         f"模式 {[m for m, _ in specs]}")
     t0 = time.time()
+    if deadline is None:
+        deadline = t0 + SCAN_BUDGET
+    budget = max(1.0, deadline - t0)
     for seg in segs:
         off = 0
         while off < seg["size"]:
+            left = deadline - time.time()
+            if left <= 0:
+                log(f"  到时限（{budget:.0f}s），停止这一级搜索（扫到 {seg['start']:#x}）")
+                return None
             sz = min(BLK, seg["size"] - off)
-            d = _pull_block(pid, seg["start"] + off, sz)
+            d = _pull_block(pid, seg["start"] + off, sz, timeout=left)
             base = seg["start"] + off
             off += sz
             if not d:
@@ -790,8 +1186,13 @@ def _scan(pid, specs, spec_check, min_mb=4):
                 v = _verify(pid, addr)
                 if not v:
                     continue
-                sc = _score(v, spec_check)
-                ok = sc >= 9 and _hud_agree(v, spec_check)
+                sc, ok, hit = 0, False, None
+                for chk in checks:
+                    s1 = _score(v, chk)
+                    if s1 > sc:
+                        sc, hit = s1, chk
+                    if s1 >= 9 and _hud_agree(v, chk):
+                        ok = True
                 log(f"    候选 {addr:#x} via={mode} score={sc:.0f} "
                     f"g={v['gold']:,} e={v['elixir']:,} d={v['dark']:,}"
                     + ("" if ok else "（否）"))
@@ -801,12 +1202,13 @@ def _scan(pid, specs, spec_check, min_mb=4):
                         log("      二次读数不稳，判为假地址，继续搜")
                         continue
                     return addr, mode, v2, time.time() - t0
-            if time.time() - t0 > SCAN_BUDGET:
+            if time.time() > deadline:
+                log(f"  到时限（{budget:.0f}s），停止这一级搜索")
                 return None
     return None
 
 
-def relocate():
+def relocate(budget=None, stage=None):
     """地址失效后重新定位，返回 True/False。成功时写回 coc_state.json。
 
     搜索窗口按项拼（见 _seed_spec）：
@@ -815,13 +1217,39 @@ def relocate():
       哪一项都没有 → 不约束那一项，靠另外两项 + 结构分把关
     一次扫描里同时用 exact3 和 near（省时间），逐类搜索（shape）当最后手段，
     而且必须有样本值参与打分 —— 否则结构特征会成片命中数据表。
+
+    时间预算（这是防「一轮无限跑」的主要一处）：
+      stage 单级搜索（精确 / 宽窗 / 结构兜底）的时限，默认 LOCATE_STAGE = 180s
+      budget 整轮定位的总时限，默认 LOCATE_TOTAL = 300s，到点直接返回 False
+    三级搜索一级比一级贵，每级都跑到底实测能烧十分钟以上；到点宁可这一轮不干活，
+    也不能把游戏挂着白烧屏幕。
     """
     t0 = time.time()
+    stage = float(stage or LOCATE_STAGE)
+    total_budget = float(budget or LOCATE_TOTAL)
+    hard_end = t0 + total_budget
+
+    def mark(ok, timed_out=False, why=None, addr=None):
+        global LOCATE_INFO
+        LOCATE_INFO = dict(ok=bool(ok), sec=round(time.time() - t0, 1),
+                           budget_s=total_budget, stage_s=stage,
+                           timed_out=bool(timed_out), why=why,
+                           addr=(f"{addr:#x}" if addr else None),
+                           steps=list(_STEPS))
+        return bool(ok)
+
+    def dl():
+        return min(time.time() + stage, hard_end)
+
+    def out_of_time(what):
+        log(f"  {what}：整轮定位到时限（{total_budget:.0f}s），放弃这一轮")
+
+    _STEPS.clear()
     try:
         pid = find_pid()
     except RuntimeError as e:
         log(f"重定位失败：{e}")
-        return False
+        return mark(False, why=f"no_pid: {e}")
     s = shell()
     s.pid = pid
 
@@ -838,8 +1266,15 @@ def relocate():
             if hud and hud[0] and hud[1]:
                 break
     spec = _seed_spec(hud, sample)
+    # 验收窗口给两组：画面那组 + 上一轮读数那组。任一组对得上就收。
+    # 只给一组的话，画面某一项认错一位就让所有正确候选都被一票否决（实测整轮定位必然失败）。
+    checks = [spec]
+    sample_spec = _seed_spec(None, sample) if sample else None
+    if sample_spec and [(v, t) for v, t in sample_spec] != [(v, t) for v, t in spec]:
+        checks.append(sample_spec)
     log(f"  窗口：画面 {hud} / 上一轮 {sample} → "
-        f"{[(v, t) for v, t in spec]}")
+        f"{[(v, t) for v, t in spec]}"
+        + ("（验收时与上一轮那组任一命中即收）" if len(checks) > 1 else ""))
 
     specs = []
     if hud and all(hud):
@@ -849,22 +1284,33 @@ def relocate():
     if sample and tuple(x or 0 for x in (hud or (None, None, None))) != sample:
         specs.append(("exact3", [(v, 0.02) for v in sample]))
 
-    res = _scan(pid, specs, spec, min_mb=4) if specs else None
+    res = _scan(pid, specs, checks, min_mb=4, deadline=dl()) if specs else None
+    _STEPS.append("exact/near>=4MB")
     if res is None and specs:
+        if time.time() >= hard_end:
+            out_of_time("第二级未开始")
+            return mark(False, timed_out=True, why="stage1_exhausted")
         # 刚启动的游戏堆是新建的，资源结构常常落在小于 4MB 的小段里，
         # 第一遍（只扫 >=4MB）会漏；用同样的种子再扫一遍小段，比直接退到结构搜索稳。
         log("  第一遍没命中，扫小段再来一遍")
-        res = _scan(pid, specs, spec, min_mb=1)
+        res = _scan(pid, specs, checks, min_mb=1, deadline=dl())
+        _STEPS.append("exact/near>=1MB")
     if res is None:
         shape_seed = [(v, 0.02) if v else (None, None) for v in (sample or hud or ())]
         if len(shape_seed) == 3:
+            if time.time() >= hard_end:
+                out_of_time("结构兜底未开始")
+                return mark(False, timed_out=True, why="stage2_exhausted")
             log("  逐类搜索兜底（带样本值打分）")
-            res = _scan(pid, [("shape", shape_seed)], shape_seed, min_mb=1)
+            res = _scan(pid, [("shape", shape_seed)], checks, min_mb=1, deadline=dl())
+            _STEPS.append("shape>=1MB")
         else:
             log("  没有种子也没有画面读数，拒绝用结构搜索写地址（容易命中数据表）")
+            _STEPS.append("shape_skipped（没有种子）")
     if res is None:
-        log(f"重定位失败，用时 {time.time() - t0:.0f}s")
-        return False
+        to = time.time() >= hard_end
+        log(f"重定位失败，用时 {time.time() - t0:.0f}s（上限 {total_budget:.0f}s）")
+        return mark(False, timed_out=to, why="no_candidate")
 
     addr, why, v, dt = res
     save_state({"gold": addr, "elixir": addr + 4, "dark": addr + 8, "gems_addr": addr - 4,
@@ -872,7 +1318,7 @@ def relocate():
                 "pid": pid, "located_at": int(time.time()), "located_via": why})
     log(f"重定位成功 {addr:#x} via={why}（{dt:.0f}s） "
         f"g={v['gold']:,} e={v['elixir']:,} d={v['dark']:,}")
-    return True
+    return mark(True, why=why, addr=addr)
 
 
 def invalidate(reason=""):
@@ -1387,8 +1833,23 @@ def main():
             print(json.dumps(read_all(), ensure_ascii=False))
         elif cmd == "locate":
             ok = relocate()
-            print(json.dumps({"ok": ok, "state": load_state()}, ensure_ascii=False))
+            print(json.dumps({"ok": ok, "info": LOCATE_INFO, "state": load_state()},
+                             ensure_ascii=False))
             return 0 if ok else 1
+        elif cmd == "cold":
+            # 一轮开始：唤醒解锁 → 没跑就拉起 → 等进村
+            print(json.dumps(start_round(), ensure_ascii=False))
+        elif cmd == "close":
+            print(json.dumps(close_game(), ensure_ascii=False))
+        elif cmd == "sleep":
+            print(json.dumps(sleep_screen(), ensure_ascii=False))
+        elif cmd == "power":
+            print(json.dumps(power_state(), ensure_ascii=False))
+        elif cmd == "village":
+            k, j = village_probe()
+            print(json.dumps({"kind": k, "text": j[:120]}, ensure_ascii=False))
+        elif cmd == "shutdown":
+            print(json.dumps(shutdown(), ensure_ascii=False))
         elif cmd == "calib":
             img = grab()
             T = calibrate(img)

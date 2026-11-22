@@ -27,9 +27,11 @@
   python3 coc_patrol_run.py --backend memory --dry # 内存后端空跑一轮（迁代码/验证用）
 """
 import argparse
+import fcntl
 import json
 import os
 import shutil
+import signal
 import sys
 import time
 
@@ -38,6 +40,53 @@ import cv2
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import coc_config
+
+# cron 那行是 `flock -n /tmp/coc_patrol.lock python ...`，手动跑也要抢同一把锁。
+LOCK_PATH = "/tmp/coc_patrol.lock"
+_lock_fd = None
+
+
+class RoundTimeout(BaseException):
+    """一轮超时（看门狗）。继承 BaseException 是故意的：后端里到处是 except Exception，
+    继承 Exception 会被它们吞掉，超时就冒不到收尾那一步了。"""
+
+
+def _on_alarm(signum, frame):
+    raise RoundTimeout("一轮超过硬上限，看门狗强制收尾")
+
+
+def take_lock(path=LOCK_PATH):
+    """抢一轮的排他锁。返回 (ok, 说明)。抢不到就打印跳过并退出 0。
+
+    为什么用 POSIX 记录锁（fcntl.lockf）而不只是 flock：cron 的外层 flock(1) 会把
+    锁 fd 传给子进程，子进程再用 flock 抢同一个文件会**自己撞自己**（实测 EWOULDBLOCK），
+    那就变成每次 cron 都跳过一轮。lockf 和 flock 是两套互不相干的锁，不会打架；
+    外层 flock 继续负责 cron 之间的互斥，lockf 负责「手动跑 vs cron」互斥。
+    两边都用同一个锁文件，一 ps 就能看出是谁占着。
+    """
+    global _lock_fd
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o666)
+    except OSError as e:
+        return True, f"锁文件开不了（{e}），不阻塞"
+    try:
+        fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        pe = "?"
+        try:
+            pe = open(path).read().strip() or "?"
+        except OSError:
+            pass
+        os.close(fd)
+        return False, f"另一轮在跑，跳过（pid {pe}）"
+    # 锁拿到了：把自己的 pid 写进去当提示（不写任何别的信息）
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, str(os.getpid()).encode())
+    except OSError:
+        pass
+    _lock_fd = fd
+    return True, "锁已拿到"
 
 
 def parse_args(argv=None):
@@ -67,12 +116,15 @@ CFG0 = coc_config.load()
 BACKEND = ARGS.backend or CFG0.get("backend", "ocr")
 
 # 后端只在这一处分叉：两边导出同名函数，下面的流程一个字都不用改。
+_mem = None                                    # memory 后端模块本体（收尾/冷启动要用）
 if BACKEND == "memory":
+    import coc_backend_mem as _mem
     from coc_backend_mem import (sh, grab, enter_village, read_res_vote, read_workers,
                                  read_star, find_bubbles, collect_one, init_capture,
                                  close_capture, panel_open, clear_panels, open_build_list,
                                  read_build_list, upgrade_from_list, read_res_until, log,
                                  PKG, ACT)
+    _mem.set_budgets(CFG0)
 else:
     from coc_patrol2 import (sh, grab, enter_village, read_res_vote, read_workers, read_star,
                              find_bubbles, collect_one, init_capture, close_capture, panel_open,
@@ -123,6 +175,9 @@ def prune(days=KEEP_DAYS):
 
 
 def write_meta(run_dir, meta):
+    # dur_s 是给外部消费方（看板/脚本）用的字段名；duration 是老字段，两个都写，值一样
+    if meta.get("dur_s") is None and meta.get("duration") is not None:
+        meta["dur_s"] = meta["duration"]
     try:
         with open(os.path.join(run_dir, "meta.json"), "w") as f:
             json.dump(meta, f, ensure_ascii=False, indent=1, default=float)
@@ -130,22 +185,93 @@ def write_meta(run_dir, meta):
         log(f"写 meta 失败 {e}")
 
 
+def _sh_out(cmd, timeout=20):
+    """跑一条 adb shell，只要 stdout（两种后端的 sh() 签名一致）。"""
+    try:
+        r = sh(cmd, timeout=timeout)
+        return (getattr(r, "stdout", "") or "").strip()
+    except Exception:
+        return ""
+
+
+def game_pid():
+    """游戏进程还在不在（收尾时确认它真的退了）。"""
+    for tok in _sh_out(f"pidof {PKG}").split():
+        if tok.isdigit():
+            return int(tok)
+    return None
+
+
+def shutdown_round(cfg):
+    """一轮干完之后的收尾：杀游戏 + 锁屏。两个开关在 config 里，默认都开。
+
+    调用时机：必须在 meta.json 落盘之后（先杀游戏会导致后面的截图/后读拿不到数据）。
+    不管这一轮成功、失败还是被看门狗切断，都走这里。
+    """
+    out = dict(ok=True)
+    if BACKEND == "memory" and _mem is not None:
+        try:
+            return _mem.shutdown(do_close=bool(cfg.get("close_game_after_run", True)),
+                                 do_lock=bool(cfg.get("lock_screen_after_run", True)))
+        except Exception as e:
+            log(f"收尾异常（走通用实现）：{type(e).__name__}: {e}")
+    if cfg.get("close_game_after_run", True):
+        t0 = time.time()
+        _sh_out(f"am force-stop {PKG}", 25)
+        time.sleep(1.0)
+        pid = game_pid()
+        while pid and time.time() - t0 < 12:
+            time.sleep(1.0)
+            pid = game_pid()
+        out["close"] = dict(ok=not pid, pid=pid, sec=round(time.time() - t0, 1))
+        out["ok"] = out["ok"] and not pid
+        log(f"  关掉游戏 {'✓' if not pid else '✗'}（{out['close']['sec']}s，pid={pid}）")
+    if cfg.get("lock_screen_after_run", True):
+        t0 = time.time()
+        st = ""
+        for key in ("KEYCODE_SLEEP", "26"):
+            _sh_out(f"input keyevent {key}", 15)
+            time.sleep(1.4)
+            st = _sh_out('dumpsys power | grep -E "mWakefulness=|Display Power"')
+            if "mWakefulness=Asleep" in st or "mWakefulness=Dozing" in st:
+                break
+        ok = "mWakefulness=Asleep" in st or "mWakefulness=Dozing" in st
+        out["lock"] = dict(ok=ok, sec=round(time.time() - t0, 1),
+                           raw=" | ".join(x.strip() for x in st.splitlines() if x.strip())[:160])
+        out["ok"] = out["ok"] and ok
+        log(f"  锁屏 {'✓' if ok else '✗'}（{out['lock']['raw']}）")
+    return out
+
+
 # ---------------------------------------------------------------- 内存后端
 def run_memory(cfg, run_dir, meta):
-    """内存后端一轮：交给 coc_mem_auto 跑，回来补齐看板要的通用字段。"""
+    """内存后端一轮：交给 coc_mem_auto 跑，回来补齐看板要的通用字段。
+
+    超时/报错也要把「已经跑出来的部分」落进 meta：为能看出卡在哪一步
+    （是冷启动、定位还是采集），不能只留一句 timeout。
+    """
     from coc_mem_auto import MemAuto
 
     auto = MemAuto(cfg, ARGS, quiet=ARGS.quiet)
+    rec, err = None, None
     try:
         rec = auto.run_round(run_dir=run_dir, dry=ARGS.dry,
                              collect=cfg["collect"] and not ARGS.no_collect,
                              upgrade=cfg["upgrade"] and not ARGS.no_upgrade)
+    except BaseException as e:              # 含看门狗抛的 RoundTimeout（BaseException）
+        err = e
     finally:
         auto.close()
+    if rec is None:
+        rec = dict(getattr(auto, "rec", None) or {})
+        rec["status"] = "timeout" if type(err).__name__ == "RoundTimeout" else "error"
+        rec["error"] = f"{type(err).__name__}: {err}"
+        meta["partial"] = True            # 标记：这份 meta 是中途被切断的
     meta.update({k: rec.get(k) for k in
                  ("before", "after", "final", "gain", "delta", "collected", "bubbles",
                   "builders", "n_candidates", "n_plan", "research", "spent",
-                  "candidates", "calib", "brightness", "ensure", "notes", "n_ok")
+                  "candidates", "calib", "brightness", "ensure", "notes", "n_ok",
+                  "cold_start", "dur_s")
                  if rec.get(k) is not None})
     # 看板的「可升级项」读的是 items（OCR 后端填的是建筑列表行），内存后端这里换成
     # 内存枚举出来的候选：名字里带「当前级→下一级」，价格没有就留 None（看板显示 —）。
@@ -175,14 +301,21 @@ def run_memory(cfg, run_dir, meta):
 
     # 工人/星星的内存读数还没定位（是 UI 文本），补一次 OCR 给看板卡片用。
     # 内存的 builders 更准（按等级是否上涨判断在施工），两个都给看板。
+    # 超时/报错时不补：这时候 adb / 抓帧很可能已经不正常，别再往里加一条可能挂住的调用。
     try:
+        if err is not None:
+            raise RuntimeError("skipped on error")
         img = grab()
         w = read_workers(img)
         meta["workers"] = list(w)
         meta["star"] = read_star(img)
     except Exception as e:
-        meta["alerts"].append(f"ocr_workers_failed: {type(e).__name__}")
-    return 0 if meta["status"] == "ok" else 1
+        if err is None:
+            meta.setdefault("alerts", []).append(f"ocr_workers_failed: {type(e).__name__}")
+    meta.setdefault("alerts", [])
+    if err is not None:
+        raise err                         # 交给 main：超时→写 alert + 走收尾
+    return 0 if meta.get("status") == "ok" else 1
 
 
 # ---------------------------------------------------------------- OCR 后端
@@ -298,9 +431,9 @@ def run_ocr(cfg, run_dir, meta):
         log(f"异常 {meta['error']}")
         return 1
     finally:
+        # 这里只收抓帧；杀游戏 + 锁屏统一交给 main() 的 shutdown_round()：
+        # 必须在 meta.json 落盘之后做，否则最后的截图/读数拿不到。
         close_capture()
-        sh(f"am force-stop {PKG}")
-        sh("input keyevent KEYCODE_SLEEP")
 
 
 # ---------------------------------------------------------------- 主流程
@@ -317,11 +450,20 @@ def main():
             cfg[key] = v
     dry = ARGS.dry
 
+    # 抢锁：手动跑和 cron 跑共用同一把锁，抢不到就干净退出（不进目录、不碰手机）
+    got, why = take_lock()
+    if not got:
+        print(why, flush=True)
+        return 0
+
     if ARGS.if_due and BACKEND != "memory":
         ok, now = coc_config.due_now(cfg)
         if not ok:
             return 0                       # 没到点，静默退出（cron 每小时叫一次）
         log(f"到点执行 {now:%Y-%m-%d %H:%M} (北京时间)")
+
+    if BACKEND == "memory" and _mem is not None:
+        _mem.set_budgets(cfg)
 
     run_id = time.strftime("%Y%m%d_%H%M%S")
     run_dir = os.path.join(HIST, run_id)
@@ -331,20 +473,49 @@ def main():
             "before": None, "after": None, "gain": None, "final": None,
             "workers": None, "star": None, "bubbles": 0, "collected": 0,
             "items": [], "upgrade": None, "upgrades": [], "dry_upgrade": None,
-            "builders": None, "alerts": [], "duration": None, "error": None,
-            "config": cfg}
+            "builders": None, "alerts": [], "duration": None, "dur_s": None,
+            "error": None, "config": cfg}
     t0 = time.time()
     rc = 1
+
+    # 看门狗：一轮超过 round_max_s 就抛 RoundTimeout，强制走「落盘 + 收尾」。
+    # 定位那三级搜索是唯一能把一轮拖到十几分钟的地方（不拦就是游戏挂一晚白烧屏幕）。
+    limit = int(cfg.get("round_max_s") or 0)
+    armed = False
+    if limit > 0:
+        signal.signal(signal.SIGALRM, _on_alarm)
+        signal.setitimer(signal.ITIMER_REAL, limit)
+        armed = True
     try:
-        if BACKEND == "memory":
-            rc = run_memory(cfg, run_dir, meta)
-        else:
-            rc = run_ocr(cfg, run_dir, meta)
+        try:
+            if BACKEND == "memory":
+                rc = run_memory(cfg, run_dir, meta)
+            else:
+                rc = run_ocr(cfg, run_dir, meta)
+        except RoundTimeout as e:
+            meta["status"] = "timeout"
+            meta["alerts"].append(f"round_timeout_{limit}s")
+            meta["error"] = f"{e}（{limit}s）"
+            log(f"⚠ 看门狗：{meta['error']}，马上落盘并收尾")
+            rc = 1
     finally:
+        if armed:
+            signal.setitimer(signal.ITIMER_REAL, 0)   # 先撤熔断，再写盘
+            signal.signal(signal.SIGALRM, signal.SIG_DFL)
         meta["duration"] = round(time.time() - t0, 1)
+        meta["dur_s"] = meta["duration"]
         meta["end"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-        write_meta(run_dir, meta)
+        write_meta(run_dir, meta)          # 先落盘：截图/读数/升级证据都在这里了
         log(f"用时 {meta['duration']}s，记录 {run_id}（{BACKEND} 后端）")
+        # 再收尾：关游戏 + 锁屏（先杀游戏就拿不到上面的东西了）。
+        # 这一段无论上面成功/失败/超时都要跑到，否则游戏就白挂一晚。
+        try:
+            meta["shutdown"] = shutdown_round(cfg)
+        except Exception as e:
+            meta["shutdown"] = dict(ok=False, error=f"{type(e).__name__}: {e}")
+            log(f"收尾失败 {meta['shutdown']['error']}")
+        finally:
+            write_meta(run_dir, meta)      # 把收尾结果补进 meta
         prune()
     return rc
 

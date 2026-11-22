@@ -234,6 +234,33 @@ PAGE = """<!doctype html>
     </div>
 
     <div class="field">
+      <label>每轮冷启动游戏</label>
+      <div class="chips">
+        <button class="chip" data-toggle="cold_start" data-val="1">开启</button>
+        <button class="chip" data-toggle="cold_start" data-val="0">关闭</button>
+      </div>
+      <div class="desc">开启后每轮先唤醒解锁、没跑就拉起游戏、等进村再干活（内存地址会失效，要重新定位一次，单轮约 3~5 分钟）。</div>
+    </div>
+
+    <div class="field">
+      <label>跑完关掉游戏</label>
+      <div class="chips">
+        <button class="chip" data-toggle="close_game_after_run" data-val="1">开启</button>
+        <button class="chip" data-toggle="close_game_after_run" data-val="0">关闭</button>
+      </div>
+      <div class="desc">记录落盘之后再杀进程（先杀就拿不到截图和数据）。关掉游戏能省屏幕、降温度。</div>
+    </div>
+
+    <div class="field">
+      <label>跑完锁屏</label>
+      <div class="chips">
+        <button class="chip" data-toggle="lock_screen_after_run" data-val="1">开启</button>
+        <button class="chip" data-toggle="lock_screen_after_run" data-val="0">关闭</button>
+      </div>
+      <div class="desc">锁完会回读 dumpsys 确认真的睡了（mWakefulness=Asleep）；下一轮自己唤醒解锁。</div>
+    </div>
+
+    <div class="field">
       <label>允许花费的资源</label>
       <div class="chips" id="kinds">
         <button class="chip" data-kind="gold">金币</button>
@@ -360,7 +387,7 @@ function render(runs){
       <td class="num hide-sm">${dlt(g.dark)}</td>
       <td class="num">${(w[0] === null) ? '—' : w[0] + '/' + w[1]}</td>
       <td class="num hide-sm">${r.collected ?? 0}/${r.bubbles ?? 0}</td>
-      <td class="num hide-sm">${r.duration ? r.duration + 's' : '—'}</td>
+      <td class="num hide-sm">${(r.dur_s ?? r.duration) ? (r.dur_s ?? r.duration) + 's' : '—'}</td>
       <td>${st}</td>
     </tr>`;
   }).join('');

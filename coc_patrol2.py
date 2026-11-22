@@ -285,6 +285,11 @@ def find_bubbles(img):
 
 # ---------------- 进村 ----------------
 LOADING = ("正在载入", "载入游戏", "正在加载")
+# 断线框的文案。必须比 LOADING 先判：「重新载入游戏」里包含「载入游戏」，
+# 先判 LOADING 会把这个框当成加载中，于是一直等（实测就卡在这里）。
+# 「还在吗」那一段必须比村庄判据先判：断线框是压在村庄上的半透明遮罩，
+# 底栏「战斗」和右上角数字全都还看得见，光靠村庄判据会把它认成正常村庄。
+RECONNECT_WORDS = ("重新载入", "连接失败", "网络异常", "断开连接", "还在吗")
 PANEL_BTN = ("确定", "完成", "关闭", "跳过", "继续", "知道了", "领取", "好的")
 POPUP_WORDS = ("欢迎回来", "村庄被袭击", "离开村庄的这段时间")
 QUIT_WORDS = ("确定退出", "退出游戏", "退出部落")   # 只能点「取消」，绝点「确定」
@@ -295,6 +300,8 @@ AD_CLOSE = (1938, 120)          # 活动广告弹窗右上角 X
 def classify(tx):
     texts = [t["t"] for t in tx]
     joined = " ".join(texts)
+    if any(k in joined for k in RECONNECT_WORDS):
+        return "reconnect"
     if any(k in joined for k in LOADING):
         return "loading"
     if any(k in joined for k in AD_WORDS):
@@ -309,8 +316,6 @@ def classify(tx):
         for t in tx:
             if t["y"] < 100 and len("".join(c for c in t["t"] if c.isdigit())) >= 5:
                 return "village"
-    if any(k in joined for k in ("重新载入", "连接失败", "网络异常")):
-        return "reconnect"
     if any(len(t.strip()) <= 4 and any(k in t for k in PANEL_BTN) for t in texts):
         return "panel"
     return "unknown"
@@ -423,7 +428,14 @@ def enter_village(max_steps=25, warmup=16):
             log(f"  关弹窗 {b['t']!r} @({b['x']},{b['y']})")
             tap(b["x"], b["y"], 1.5)
         elif st == "reconnect":
-            tap(2147, 145, 1.0)
+            # 断线框：点「重新载入游戏」（之前 classify 的检查顺序把它误判成 loading，
+            # 这一支一直没被执行到）
+            rb = next((t for t in tx if "重新载入" in t["t"]), None)
+            if rb:
+                log(f"  断线重连 @({rb['x']},{rb['y']})")
+                tap(rb["x"], rb["y"], 2.0)
+            else:
+                tap(2147, 145, 1.0)
         else:
             time.sleep(2.0)
     return None

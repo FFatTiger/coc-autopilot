@@ -71,6 +71,9 @@ class MemAuto:
         self.cfg = cfg or {}
         self.a = args or argparse.Namespace()
         self.quiet = quiet
+        # 时间预算（等进村 / 单级定位 / 整轮定位）先从 config 应用到后端模块，
+        # 之后所有 relocate / 搜索都按它算，不另传参。
+        self.budgets = mem.set_budgets(self.cfg)
         self.s = mem.shell()
         self.ast = jload(STATE, {}) or {}
         self.bld = bldlib.Buildings(s=self.s, log=None if quiet else mem.log)
@@ -78,6 +81,7 @@ class MemAuto:
         self.n_cand_all = 0
         self.n_plan = 0
         self.cand_head = []
+        self.rec = None         # run_round 的进行中结果（超时也能拿来落盘）
 
     # ---------------- 参数（配置 + 命令行合一） ----------------
     def opt(self, name, default=None):
@@ -145,8 +149,8 @@ class MemAuto:
     # ---------------- 弹窗 ----------------
     def handle_modal(self, tries=18):
         """画面偏暗 = 模态框。断线框点「重新载入游戏」，之后等亮度恢复。"""
-        self.log(f"  画面偏暗，点「重新载入游戏」@{tuple(RECONNECT)}")
-        mem.shell().tap(*RECONNECT, wait=1.2)
+        self.log(f"  画面偏暗，点「重新载入游戏」@{tuple(mem.RELOAD_BTN)}")
+        mem.shell().tap(*mem.RELOAD_BTN, wait=1.2)
         t0 = time.time()
         while time.time() - t0 < 45:
             time.sleep(2.5)
@@ -223,7 +227,7 @@ class MemAuto:
                 tap_dy=self.opt("tap_dy", None),
                 allow_unknown_price=True, log=None if self.quiet else mem.log)
         except Exception as e:
-            self.log(f"  [targets] 枚举失败: {e}")
+            self.log(f"  [targets] 枚举失败: {type(e).__name__}: {e}")
             return []
         up = self.ast.get("mem_upgrades", {})
         bad_tap = set(self.ast.get("mem_bad_tap") or [])
@@ -526,31 +530,33 @@ class MemAuto:
                    bubbles=0, collected=0, items=[],
                    upgrade=None, upgrades=[], builders=None,
                    n_candidates=0, n_plan=0, candidates=[],
-                   calib=None, alerts=[], duration=None, error=None)
+                   calib=None, alerts=[], duration=None, dur_s=None, error=None)
         alerts = rec["alerts"]
+        self.rec = rec          # 边跑边挂在实例上：被看门狗切断时 main 还能落一份部分结果
         if run_dir:
             os.makedirs(run_dir, exist_ok=True)
 
-        # 1) 屏幕亮 + 游戏在前台 + pid 有效
+        # 1) 一轮开始：冷启动（唤醒 + 解锁 → 没跑就拉起 → 轮询等进村 → 断线框点重新载入）
+        cs = None
         try:
-            changed, why = mem.ensure_ready()
+            cs = mem.start_round(cold=bool(self.opt("cold_start", True)),
+                                 wait=self.opt("village_wait_s"))
         except Exception as e:
             rec["status"] = "failed"
-            rec["error"] = f"游戏拉不起来: {e}"
-            alerts.append("app_not_ready")
-            rec["duration"] = round(time.time() - t0, 1)
+            rec["error"] = f"冷启动异常: {type(e).__name__}: {e}"
+            alerts.append("cold_start_error")
+            rec["duration"] = rec["dur_s"] = round(time.time() - t0, 1)
             return rec
-        rec["ensure"] = why
-        if "relaunch" in why:
-            # 刚拉起来的游戏要几十秒才把村庄和资源结构建好；这时去读内存，
-            # 老地址读不到东西，重定位还会在「结构还没出现」的内存里瞎搜。
-            time.sleep(10)
-            if mem.enter_village() is None:
-                rec["status"] = "failed"
-                rec["error"] = "重开游戏后进村失败"
-                alerts.append("enter_village_failed")
-                rec["duration"] = round(time.time() - t0, 1)
-                return rec
+        rec["cold_start"] = cs
+        if not cs.get("ok"):
+            err = cs.get("error") or "unknown"
+            rec["status"] = "failed"
+            rec["error"] = f"冷启动失败: {err}"
+            # 掉登录页是红线：不尝试自己登，只写 alert 退出
+            alerts.append("login_page" if "login" in err else "cold_start_failed")
+            log(f"  ⚠ {rec['error']}")
+            rec["duration"] = rec["dur_s"] = round(time.time() - t0, 1)
+            return rec
 
         # 2) 抓一帧：画面偏暗先当模态框处理
         img = mem.grab()
@@ -565,7 +571,7 @@ class MemAuto:
                 rec["status"] = "failed"
                 rec["error"] = "断线重载后进村失败"
                 alerts.append("enter_village_failed")
-                rec["duration"] = round(time.time() - t0, 1)
+                rec["duration"] = rec["dur_s"] = round(time.time() - t0, 1)
                 return rec
 
         # 2.5) 先把挡屏的推广弹层关掉，不然下面的采集点和实验室点击全落在弹层上
@@ -575,11 +581,21 @@ class MemAuto:
                 img = _im
 
         # 3) 读资源（地址失效会自己重定位）
+        mem.LOCATE_INFO = {}            # 清一下，好知道这一轮里到底重定位过没有
         res = self.read()
         relocated = False
-        if res is None:
-            rec["relocate"] = mem.relocate()
+        if mem.LOCATE_INFO:
+            # read_all 内部自己重定位了（冷启动后 pid 变了就是这条），也要记进 meta
+            rec["relocate"] = dict(mem.LOCATE_INFO)
             relocated = True
+        if res is None and not relocated:
+            # 只有「read 里没试过定位」时才再试一次。已经试过并且失败的，
+            # 原地重试一遍只是把等待翻倍（种子、画面、pid 一模一样）。
+            ok_loc = mem.relocate()
+            rec["relocate"] = dict(ok=ok_loc, **(mem.LOCATE_INFO or {}))
+            relocated = True
+            if not ok_loc and mem.LOCATE_INFO.get("timed_out"):
+                alerts.append("locate_timeout")
             res = self.read()
             if res is not None:
                 bad = mem.check_against_ocr(res)
@@ -594,7 +610,7 @@ class MemAuto:
             rec["status"] = "failed"
             rec["error"] = "memory_unreadable（地址定位失败）"
             alerts.append("memory_unreadable")
-            rec["duration"] = round(time.time() - t0, 1)
+            rec["duration"] = rec["dur_s"] = round(time.time() - t0, 1)
             return rec
         rec["before"] = res
         res0 = dict(res)
@@ -659,8 +675,12 @@ class MemAuto:
         rec["upgrade"] = up
         if up and up.get("ok"):
             rec["upgrades"] = up.get("upgrades") or [up]
-            rec["upgrade"] = dict(name=up.get("target"), price=up.get("price_panel"),
-                                  paid=up.get("paid"), match=up.get("match"))
+            # 带上 ok：coc_patrol_run 靠这一位判断「真升了」，丢了它 meta 里
+            # upgrade 永远是 null（花了钱、看板还显示没升级，实测踩过）
+            rec["upgrade"] = dict(ok=True, name=up.get("target"),
+                                  price=up.get("price_panel"),
+                                  paid=up.get("paid"), match=up.get("match"),
+                                  n_ok=up.get("n_ok"))
         n_ok = int((up or {}).get("n_ok") or (1 if (up or {}).get("ok") else 0))
         rec["n_ok"] = n_ok
         if rec.get("builders"):
@@ -722,6 +742,7 @@ class MemAuto:
                             [int(cv2.IMWRITE_JPEG_QUALITY), 82])
         rec["status"] = "ok"
         rec["duration"] = round(time.time() - t0, 1)
+        rec["dur_s"] = rec["duration"]
         rs_txt = ""
         if rs:
             if (rs.get("result") or {}).get("ok"):
