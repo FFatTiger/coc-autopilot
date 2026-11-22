@@ -342,9 +342,10 @@ def popup_x(im):
     而研究弹窗（1755,64）和研究确认页（1847,85）各有一个 60~70px 的红圆角方块。
     比「顶部一大片浅色」靠谱——「正在升级中」那条绿色横幅会把浅色判据带瞎。
     """
-    if im is None or im.shape[0] < 200 or im.shape[1] < 1900:
+    if im is None or im.shape[0] < 300 or im.shape[1] < 1900:
         return None
-    sub = im[15:140, 1650:1960]
+    # y 放宽到 280：商店/礼包这类推广弹层的 X 比研究弹窗低一截（实测 (1830,180)）
+    sub = im[15:280, 1650:1960]
     hsv = cv2.cvtColor(sub, cv2.COLOR_BGR2HSV)
     h = hsv[:, :, 0].astype(int)
     sat = hsv[:, :, 1].astype(int)

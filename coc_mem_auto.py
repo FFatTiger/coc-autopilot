@@ -486,6 +486,26 @@ class MemAuto:
             self.log(f"  [research] 失败 {type(e).__name__}: {e}")
             return dict(alerts=["research_error:%s" % type(e).__name__])
 
+    def dismiss_modals(self, im=None, tries=2):
+        """关掉挡在村庄前面的推广弹层（礼包 / 商店 / 活动）。
+
+        为什么要单独一步：这类弹层会把整屏盖住，采集点和实验室点击全落在弹层上，
+        一轮下来一个资源收不到、面板也开不了，而且它自己会定时冒出来（实测 20:12 冒了一个「专属礼包」）。
+        判据是「右上角那个红 X」——干净村庄/建筑面板上没有这个红斑。
+        """
+        import coc_mem_research as rsch
+        for _ in range(max(1, tries)):
+            im = im if im is not None else mem.grab()
+            if im is None:
+                return None
+            pos = rsch.popup_x(im)
+            if not pos:
+                return im
+            self.log(f"  关掉挡屏弹层 @{pos}")
+            mem.shell().tap(*pos, wait=1.2)
+            im = None
+        return mem.grab()
+
     # ---------------- 一轮 ----------------
     def run_round(self, run_dir=None, dry=False, collect=True, upgrade=True):
         """跑一轮，返回写进 meta.json 的那份 dict（截图落到 run_dir）。"""
@@ -539,6 +559,10 @@ class MemAuto:
                 alerts.append("enter_village_failed")
                 rec["duration"] = round(time.time() - t0, 1)
                 return rec
+
+        # 2.5) 先把挡屏的推广弹层关掉，不然下面的采集点和实验室点击全落在弹层上
+        if not dry:
+            img = self.dismiss_modals(img) or img
 
         # 3) 读资源（地址失效会自己重定位）
         res = self.read()
