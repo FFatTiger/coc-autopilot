@@ -565,11 +565,20 @@ CURRENCY_DEFAULT = {
 NO_UPGRADE = ("Helper Hut", "Crafting Station", "BB Reinforcement Camp",
               "BB Battle Machine Altar", "Builders Hut", "BB Army Camp")
 
-# 永远不参与自动升级的（用户红线：大本营 / 部落城堡 / 英雄建筑 / 实验室）。
-# 这些即使建造成本很低也不碰——升错一个就毁了整个号。
+# 永远不参与「建筑本体升级」的（用户红线）：大本营 / 部落城堡 / 英雄建筑 / 宠物屋 /
+# 铁匠铺 / 实验室本体 / 法术工厂本体。
+# 这些是长期投资、占工人、升错一个就毁了整个号，所以即使很便宜也不碰。
+#
+# 注意：这份名单只拦「建筑本体升级」，**不拦研究**。在实验室里研究兵种/法术是另一条
+# 路径（coc_mem_research），它不占工人、只有 1 个槽位、界面和校验完全不同。
+# 两件事必须分开：以前实验室只在这一个名单里，导致「实验室不能升」被误读成「不能研究」。
 NEVER_UPGRADE = ("Town Hall", "Clan Castle", "Hero Hall", "Laboratory",
-                 "Pet House", "Blacksmith", "BB Battle Machine",
-                 "BB Battle Copter", "BB Builder Hall")
+                 "Spell Factory", "Dark Spell Factory", "Pet House", "Blacksmith",
+                 "BB Battle Machine", "BB Battle Copter", "BB Builder Hall")
+
+# 研究走 coc_mem_research：实验室 / 法术工厂 / 暗黑法术工厂里的「研究对象」不受
+# NEVER_UPGRADE 约束（建筑本体照样不许升）。
+RESEARCH_BUILDINGS = ("Laboratory", "Spell Factory", "Dark Spell Factory")
 
 
 def currency_of(name):
@@ -599,7 +608,8 @@ def note_blocked(name, level, reason=""):
 
 
 def discover_upgrade_targets(bld=None, res=None, T=None, currency="gold",
-                             max_cost=None, include_bb=False, include_walls=True,
+                             max_cost=None, max_cost_by_currency=None,
+                             include_bb=False, include_walls=True,
                              include=(), exclude=(), allow_unknown_price=True,
                              max_level=None, min_level=1, skip_blocked=True,
                              tap_dy=None, tap_dx=None, log=None):
@@ -610,6 +620,7 @@ def discover_upgrade_targets(bld=None, res=None, T=None, currency="gold",
       T            coc_backend_mem.calibrate 的 {s,tx,ty}；None 返回标定视图坐标
       currency     'gold'/'elixir'/'dark'/'any'
       max_cost     单个升级价格上限（需要 price 已知）
+      max_cost_by_currency  {币种: 上限}，给了就按币种各管各的（优先于 max_cost）
       include_bb   是否包含夜世界
       include_walls 是否包含城墙
       include/exclude 类型名白/黑名单
@@ -663,7 +674,12 @@ def discover_upgrade_targets(bld=None, res=None, T=None, currency="gold",
         cost = pr["cost"] if pr else None
         if cost is None and not allow_unknown_price:
             continue
-        if cost is not None and max_cost and cost > max_cost:
+        cap = None
+        if max_cost_by_currency:
+            cap = max_cost_by_currency.get(cur)
+        elif max_cost:
+            cap = max_cost
+        if cost is not None and cap and cost > cap:
             continue
         if cost is not None and res and cur in res and cost > res[cur]:
             continue

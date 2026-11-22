@@ -90,6 +90,29 @@ class MemAuto:
         if not self.quiet:
             mem.log(msg)
 
+    # ---------------- 币种 ----------------
+    def caps(self):
+        """每个币种的单次花费上限（config 里各管各的；max_price 是老配置的金币上限）"""
+        gold = self.opt("max_cost_gold")
+        if gold is None:
+            gold = self.opt("max_price", 3_000_000)
+        return {"gold": int(gold or 0),
+                "elixir": int(self.opt("max_cost_elixir", 6_000_000) or 0),
+                "dark": int(self.opt("max_cost_dark", 100_000) or 0)}
+
+    def kinds(self):
+        """允许花的币种（按优先级排：圣水满仓先花圣水，暗黑量少排第二，金币最后）"""
+        ks = self.opt("upgrade_kinds") or ["gold"]
+        cur = self.opt("currency")
+        if cur and cur != "any":
+            ks = [cur]                      # 老配置只写了 currency，就按它来
+        prio = self.opt("upgrade_currency_priority") or ["elixir", "dark", "gold"]
+        out = [k for k in prio if k in ks]
+        return out + [k for k in ("gold", "elixir", "dark") if k in ks and k not in out]
+
+    def cur_prio(self):
+        return {c: i for i, c in enumerate(self.kinds())}
+
     # ---------------- 读数 ----------------
     def read(self, retries=2):
         """读一次四项资源；读不到返回 None（read_all 内部会尝试重定位）。"""
@@ -191,9 +214,10 @@ class MemAuto:
         """用内存枚举出可升级目标，并算这一轮允许试几个（受空闲工人数约束）。"""
         a = self.a
         try:
+            kinds = self.kinds()
             tg = bldlib.discover_upgrade_targets(
-                self.bld, res=res, T=T, currency=self.opt("currency", "gold"),
-                max_cost=self.opt("max_cost", 3_000_000),
+                self.bld, res=res, T=T, currency="any",
+                max_cost_by_currency={c: self.caps()[c] for c in kinds},
                 include_bb=bool(self.opt("include_bb", False)),
                 include_walls=bool(self.opt("include_walls", True)),
                 tap_dy=self.opt("tap_dy", None),
@@ -206,7 +230,10 @@ class MemAuto:
         now = time.time()
         cd = float(self.opt("mem_cooldown_h", 24) or 24) * 3600
         out = []
+        prio = self.cur_prio()
         for t in tg:
+            if t["currency"] not in prio:
+                continue
             key = "%s|%d|%.1f,%.1f" % (t["name"], t["level"], t["x"], t["y"])
             last = up.get(key)
             if last and now - last.get("ts", 0) < last.get("cd", cd):
@@ -222,8 +249,9 @@ class MemAuto:
                             cost=t["price"], _key=key, _safe=safe,
                             _level=t["level"], _type=t["name"], _dy=t.get("tap_dy"),
                             _world=[t["x"], t["y"]], _screen=t["screen"]))
-        # 便宜的、价格已知的、点击点安全的排前面
-        out.sort(key=lambda x: (not x["_safe"], x["cost"] is None, x["cost"] or 0))
+        # 排序：点击点安全的 → 币种优先级（圣水满仓先花圣水）→ 价格已知的 → 便宜的
+        out.sort(key=lambda x: (not x["_safe"], prio.get(x["currency"], 9),
+                                x["cost"] is None, x["cost"] or 0))
         self.n_cand_all = len(out)          # 截断前的真实候选数（日志里要如实反映）
         bs = self.builders_state()
         self.bstate = bs
@@ -268,10 +296,11 @@ class MemAuto:
     def upgrade_targets(self, tg, dis, res, dry=False):
         """点建筑 → 面板 → 点「升级」→ 确认页 → 点「确认」，每步都验，任一步不符就退出。
 
-        三处硬闸（任何一处不过都不往下走）：
+        四处硬闸（任何一处不过都不往下走）：
           ① 面板必须开，且标题等级 == 内存等级（否则是点到旁边的墙/别的建筑）
-          ② 面板价格必须读出来、币种必须是 gold、价格 <= 上限、且金币够
-          ③ 必须认到确认页的绿色「确认」按钮才点——认不到就关掉（工人不足/资源不足的弹窗）
+          ② 面板价格必须读出来，币种必须在允许列表里（金币/圣水/暗黑，宝石永远不在）
+          ③ 价格 <= 该币种的单次上限（各币种分别设），且该币种库存够
+          ④ 必须认到确认页的绿色「确认」按钮才点——认不到就关掉（工人不足/资源不足的弹窗）
         扣费以内存差值为准，和面板价格对不上就记 alert。
         dry=True 只走「读数 + 挑目标」，一次点击都不发。
         """
@@ -281,7 +310,8 @@ class MemAuto:
         oks = []
         attempts = []
         idle_cap = self.n_plan or 0
-        max_cost = self.opt("max_cost")
+        caps = self.caps()
+        kinds = self.kinds()
         max_targets = int(self.opt("max_targets", 3) or 0)
         for t in tg:
             if max_targets and tried >= max_targets:
@@ -312,11 +342,9 @@ class MemAuto:
             pan = panel.read(im) if im is not None else {"open": False}
             why = None
             # 面板一开、标题等级对上，就把读到的价格写进价格表（source=panel_prod）。
-            # 这一步是白捡的：即使这一笔因为超上限/金币不够没升，价格也算探到了。
+            # 这一步是白捡的：即使这一笔因为超上限/币种不够没升，价格也算探到了。
             if (pan.get("open") and pan.get("title_level") == t["_level"]
                     and pan.get("price")):
-                # 红字（买不起）读出来的价只当参考值：红字抗锯齿后笔画会糊，
-                # 实测把 2,800,000 读成过 2,000,000（8 被认成 0）
                 try:
                     self.bld.record_price(
                         t["_type"], t["_level"], pan.get("currency") or "unknown",
@@ -324,6 +352,7 @@ class MemAuto:
                         source="panel_prod_red" if pan.get("price_red") else "panel_prod")
                 except Exception:
                     pass
+            cur = pan.get("currency")
             if not pan.get("open"):
                 why = "no_panel"
             elif pan.get("title_level") != t["_level"]:
@@ -331,24 +360,18 @@ class MemAuto:
                                                             t["_level"])
             elif pan.get("price") is None:
                 why = "no_price"
-            elif pan.get("currency") != "gold":
-                why = "currency_%s" % pan.get("currency")
-            elif bldlib.currency_of(t["_type"]) != "gold":
-                # 双保险（红线：只花金币）：面板认成金币还不够，这个类型本身按静态
-                # 表也必须花金币。金矿/储金罐/兵营/实验室这些实际花圣水的，一律不进。
-                why = "type_currency_%s" % bldlib.currency_of(t["_type"])
-            elif max_cost and pan["price"] > max_cost:
-                why = "over_cap(%d>%d)" % (pan["price"], max_cost)
-            elif pan["price"] > (res.get("gold") or 0):
-                why = "insufficient(%d>%d)" % (pan["price"], res.get("gold") or 0)
+            elif cur not in kinds:
+                why = "currency_%s" % cur
+            elif caps.get(cur) and pan["price"] > caps[cur]:
+                why = "over_cap(%d>%d)" % (pan["price"], caps[cur])
+            elif pan["price"] > (res.get(cur) or 0):
+                why = "insufficient(%d>%d %s)" % (pan["price"], res.get(cur) or 0, cur)
             if why:
                 mem.shell().tap(*dis, wait=0.6)
                 self._note_fail(t, why)
                 self.log(f"  [upgrade] {t['name']} 放弃：{why}")
                 rec = dict(target=t["name"], ok=False, why=why, panel=pan)
                 attempts.append(dict(target=t["name"], ok=False, why=why))
-                # 这几类只是「这个目标不合适」，换下一个目标继续试；
-                # no_price 连续 2 次会进 building_blocked.json，以后不再选它
                 continue
 
             price = int(pan["price"])
@@ -356,6 +379,8 @@ class MemAuto:
             price_note = None
             if price_cfg is not None and price_cfg != price:
                 price_note = "table=%d panel=%d" % (price_cfg, price)
+            # 静态币种表和面板实测不一致时只记一笔（实测为准），不拦
+            table_cur = bldlib.currency_of(t["_type"])
             # ③ 点「升级」→ 确认页
             mem.shell().tap(*panel_btn, wait=1.0)
             p2 = self._shot_panel("confirm_%s" % t["_type"])
@@ -377,7 +402,7 @@ class MemAuto:
             p3 = self._shot_panel("after_%s" % t["_type"])
             rec = dict(target=t["name"], ok=bool(paid), price_panel=price,
                        paid=paid, before=dict(before), after=dict(after),
-                       currency_panel=pan.get("currency"), cost_cfg=price_cfg,
+                       currency_panel=cur, cost_cfg=price_cfg, caps=caps,
                        price_note=price_note, panel_jpg=p, confirm_jpg=p2,
                        after_jpg=p3, btn=panel_btn, confirm=cf["btn"])
             if not paid:
@@ -386,35 +411,36 @@ class MemAuto:
                 self.log(f"  [upgrade] {t['name']} 没扣钱（面板 {price}）")
                 rec["attempts"] = attempts
                 return rec, after
-            # 扣费验证：金币差应该 == 面板价（允许 ±25 自然增长）
-            got = paid.get("gold", 0)
+            # 扣费验证：扣的币种必须 == 面板币种，金额 == 面板价（允许 ±25 自然增长）
+            got = paid.get(cur, 0)
             rec["match"] = abs(got - price) <= 25
             if not rec["match"]:
                 rec["alert"] = "cost_mismatch(panel=%d paid=%d)" % (price, got)
-            if any(paid.get(c) for c in ("elixir", "dark")):
+            if set(paid) - {cur}:
                 rec["alert"] = "wrong_currency_paid: %s" % paid
+            if table_cur != cur:
+                rec["table_currency"] = table_cur
             self.ast.setdefault("mem_upgrades", {})[t["_key"]] = dict(
                 ts=int(time.time()),
                 cd=float(self.opt("mem_cooldown_h", 24) or 24) * 3600,
-                name=t["name"], paid=paid, price_panel=price)
+                name=t["name"], paid=paid, price_panel=price, currency=cur)
             # 实测扣费就是真价 → 回填价格表（源=upgrade_delta）
             # 但「面板价和表里的价不一致」时不写表：那说明点开的可能是同等级的另一栋
             # （实测点加农炮会点到同格的隐形炸弹），写进去就把表污染了
             trusted = self.bld.price_trusted(t["_type"], t["_level"])
             if price_cfg is None or price_cfg == price or not trusted:
-                cur = "gold" if got else next(iter(paid), "gold")
-                self.bld.record_price(t["_type"], t["_level"], cur, got or price,
+                self.bld.record_price(t["_type"], t["_level"], cur or "gold", got or price,
                                       source="upgrade_delta")
             else:
                 rec["price_skipped"] = "table=%d panel=%d（不覆盖价格表）" % (price_cfg, price)
                 self.log(f"  [upgrade] 面板价 {price} 与表里 {price_cfg} 不一致，不写价格表")
             mem.shell().tap(*dis, wait=0.3)
-            self.log(f"  [upgrade] ✓ {t['name']} 扣 {paid}（面板 {price}，"
+            self.log(f"  [upgrade] ✓ {t['name']} 扣 {paid}（面板 {price} {cur}，"
                      f"匹配 {rec['match']}）")
             rec["attempts"] = attempts
             oks.append(rec)
             n_ok += 1
-            res = after                       # 下面的「金币够不够」用扣完之后的数
+            res = after                       # 下面「够不够」用扣完之后的数
             continue                          # 还有空工人就继续下一个目标
         if oks:
             total_paid = {}
@@ -435,6 +461,30 @@ class MemAuto:
             rec["attempts"] = attempts
             return rec, res
         return None, res
+
+    # ---------------- 研究 ----------------
+    def run_research(self, res, dry=False):
+        """实验室研究一步。节流：忙时只看状态不开面板；闲时节流 N 分钟查一次。
+
+        为什么节流：cron 每 10 分钟一轮，而研究要占实验室好几个小时。忙的时候每轮都去
+        开实验室面板 = 白点几十下（手机发烫），所以先用状态里的「在研究什么 + 多久」判断。
+        """
+        import coc_mem_research as research
+        busy = research.Research(s=self.s, bld=self.bld, cfg=self.cfg,
+                                 log=self.log).busy_reason()
+        if busy and not dry:
+            self.log(f"  [research] 实验室在忙：{busy}")
+            return dict(busy=busy, skipped="researching")
+        last = (self.ast.get("mem_research_check") or {}).get("ts", 0) or 0
+        gap = float(self.opt("research_min_gap_min", 30) or 0) * 60
+        if not dry and last and time.time() - last < gap:
+            return dict(skipped="gap", next_in=int(gap - (time.time() - last)))
+        self.ast["mem_research_check"] = dict(ts=int(time.time()), at=iso_now())
+        try:
+            return research.run(self, res, dry=dry)
+        except Exception as e:
+            self.log(f"  [research] 失败 {type(e).__name__}: {e}")
+            return dict(alerts=["research_error:%s" % type(e).__name__])
 
     # ---------------- 一轮 ----------------
     def run_round(self, run_dir=None, dry=False, collect=True, upgrade=True):
@@ -568,6 +618,15 @@ class MemAuto:
             rec["builders"]["idle_after"] = max(
                 0, int(rec["builders"].get("idle") or 0) - n_ok)
 
+        # 6.5) 实验室研究（只有 1 个槽位，和工人的逻辑不同：不看工人数，看实验室忙不忙）
+        rs = None
+        if upgrade and self.opt("research", True):
+            rs = self.run_research(after_collect, dry=dry)
+            rec["research"] = rs
+            rres = (rs or {}).get("result") or {}
+            if rres.get("ok"):
+                after_collect = rres.get("after") or after_collect
+
         # 7) 收尾读数 + 增量
         if not dry:
             time.sleep(1.0)
@@ -584,12 +643,16 @@ class MemAuto:
                        for k in ("gold", "elixir", "dark")}
         rec["delta"] = rec["gain"]
 
-        # 硬报警：资源总量不该变少（除了升级扣费）
-        paid = (up or {}).get("paid", {}) if up else {}
+        # 硬报警：资源总量不该变少（除了升级 / 研究扣费）
+        paid = dict((up or {}).get("paid", {}) if up else {})
+        rs_paid = ((rs or {}).get("result") or {}).get("paid") or {}
+        for c, v in rs_paid.items():
+            paid[c] = paid.get(c, 0) + v
         for k in ("gold", "elixir", "dark"):
             g = rec["gain"].get(k)
             if g is not None and g + (paid.get(k) or 0) < -1:
                 alerts.append("resource_dropped_%s_%d" % (k, g))
+        rec["spent"] = paid
         notes = []
         if (final.get("elixir") or 0) >= 11_000_000:
             notes.append("圣水 11,000,000 已满，圣水收集增量恒为 0")
@@ -610,8 +673,21 @@ class MemAuto:
                             [int(cv2.IMWRITE_JPEG_QUALITY), 82])
         rec["status"] = "ok"
         rec["duration"] = round(time.time() - t0, 1)
+        rs_txt = ""
+        if rs:
+            if (rs.get("result") or {}).get("ok"):
+                r0 = rs["result"]
+                rs_txt = " | 研究 %s→%s级 %s" % (r0.get("name"), r0.get("target_level"),
+                                                 r0.get("paid"))
+            elif rs.get("busy"):
+                rs_txt = " | 实验室在忙: %s" % rs["busy"]
+            elif rs.get("picked"):
+                rs_txt = " | 研究候选 %s %s %s" % (
+                    (rs.get("picked") or {}).get("name") or "?",
+                    (rs.get("picked") or {}).get("price"),
+                    (rs.get("picked") or {}).get("currency"))
         self.log(f"一轮结束 {rec['duration']}s | 资源 {res0} → {final} | "
-                 f"工人 {rec['builders']} | 升级 {n_ok} 笔")
+                 f"工人 {rec['builders']} | 升级 {n_ok} 笔 | 花费 {paid}{rs_txt}")
         return rec
 
     def close(self):

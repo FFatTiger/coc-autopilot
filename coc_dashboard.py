@@ -412,6 +412,15 @@ function toggle(tr, run){
     `<span class="item">${esc(i.name)} · ${fmt(i.price)} ${i.kind === 'gold' ? '金币' : i.kind === 'elixir' ? '圣水' : i.kind === 'dark' ? '暗黑' : '未知'}</span>`).join('');
   const up = run.upgrade ? `<div class="items"><span class="item" style="border-color:#dcfce7;color:#16a34a">
      已升级 ${esc(run.upgrade.name)} · ${fmt(run.upgrade.price)}</span></div>` : '';
+  const rsc = run.research || {};
+  const rres = rsc.result || {};
+  const rtxt = rres.ok
+    ? `研究中 ${esc(rres.name || '?')} 升到 ${esc(rres.target_level || '?')} 级 · ${fmt(rres.panel_price)} ${rres.panel_currency === 'dark' ? '暗黑' : rres.panel_currency === 'elixir' ? '圣水' : '金币'}`
+    : (rsc.busy ? `实验室在忙：${esc(rsc.busy)}`
+       : (rsc.picked ? `研究候选 ${esc(rsc.picked.name || '?')} · ${fmt(rsc.picked.price)}`
+          : (rsc.skipped === 'research_disabled' ? '' : '实验室：本轮没动')));
+  const rs = rtxt ? `<div class="items"><span class="item" style="border-color:#e0e7ff;color:#4338ca">
+     ${rtxt}</span></div>` : '';
   const err = run.error ? `<div style="color:#dc2626;font-size:13px;margin-top:10px">${esc(run.error)}</div>` : '';
   const row = document.createElement('tr');
   row.className = 'detail-row';
@@ -431,7 +440,7 @@ function toggle(tr, run){
         <span style="margin-left:auto">拖动分割线对比</span>
       </div>
       ${items ? '<h3 style="margin-top:16px">可升级项</h3><div class="items">' + items + '</div>' : ''}
-      ${up}${err}
+      ${up}${rs}${err}
     </div></td>`;
   tr.after(row);
   const cmp = row.querySelector('.cmp');

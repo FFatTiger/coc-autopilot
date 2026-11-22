@@ -5,17 +5,30 @@
   "schedule": ["09:00", "13:00", "18:00", "22:00"],
   "collect": true,
   "upgrade": true,
-  "upgrade_kinds": ["gold", "elixir"],
+  "upgrade_kinds": ["gold", "elixir", "dark"],
   "max_price": 3000000,
   "max_upgrades": 1,
   "min_free_workers": 1,
 
-  "_memory说明": "以下只对 memory 后端生效。max_targets = 每轮最多试几个目标（实际还受空闲工人数限制）；budget 用 max_price 卡；只升 currency 指定的货币（升级面板的币种还要再过一遍校验）。",
+  "_memory说明": "以下只对 memory 后端生效。max_targets = 每轮最多试几个目标（实际还受空闲工人数限制）；currency = any 时按 upgrade_kinds 里的币种都花，面板上的币种还要再过一遍校验。",
   "max_targets": 5,
   "builders": 5,
   "include_walls": false,
   "include_bb": false,
-  "currency": "gold",
+  "currency": "any",
   "build_max_h": 168,
-  "mem_cooldown_h": 24
+  "mem_cooldown_h": 24,
+
+  "_币种说明": "单次花费上限按币种分别设，宝石永远不参与（代码里没有宝石分支）。upgrade_currency_priority 决定先花哪种资源：圣水满仓会浪费所以排第一，暗黑量少排第二（只够便宜档），金币还在自然增长排最后。",
+  "max_cost_gold": 3000000,
+  "max_cost_elixir": 6000000,
+  "max_cost_dark": 100000,
+  "upgrade_currency_priority": ["elixir", "dark", "gold"],
+
+  "_研究说明": "research = 是否自动做实验室研究（兵种 / 法术，含圣水与暗黑两套）。研究只占实验室那 1 个槽位，不占工人；大本营 / 城堡 / 英雄建筑 / 实验室与法术工厂的「本体升级」仍然禁止，研究是另一条路。research_min_gap_min = 实验室空着时最快多少分钟查一次（防止每 10 分钟都去点一遍手机）。",
+  "research": true,
+  "research_currency_priority": ["elixir", "dark", "gold"],
+  "research_min_gap_min": 30,
+  "research_max_pages": 8,
+  "research_max_h": 240
 }

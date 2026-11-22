@@ -10,8 +10,11 @@
 
 安全边界（两种后端一样）：
 - 只点收集气泡（内存后端是标定表里的采集点）和「升级」按钮，不盲点坐标；
-- 只升级 gold 项目，暗黑重油/圣水项目一律不碰（后者要显式在 upgrade_kinds 里开）；
-- 单次升级价格上限 max_price；每轮最多 max_upgrades 笔、最多试 max_targets 个目标；
+- 花的币种由 upgrade_kinds 决定（默认 gold / elixir / dark 三种都开）；宝石永远不花；
+- 单次花费上限按币种分别设（max_cost_gold / max_cost_elixir / max_cost_dark），
+  面板上的币种必须在这个白名单里才点确认；每轮最多 max_upgrades 笔、最多试 max_targets 个目标；
+- 实验室研究（兵种 / 法术）走 coc_mem_research：只占实验室那 1 个槽位、不占工人；
+  大本营 / 城堡 / 英雄建筑 / 实验室与法术工厂的**建筑本体升级**仍然禁止；
 - 任何面板认不出就用 BACK + 点空地退出，不做猜测性点击。
 
 每轮记录落在 history/<时间戳>/：meta.json + before.jpg + after.jpg，看板读的就是它。
@@ -19,7 +22,7 @@
 用法:
   python3 coc_patrol_run.py                        # 真跑一轮（后端按 config）
   python3 coc_patrol_run.py --backend memory       # 强制内存后端跑一轮
-  python3 coc_patrol_run.py --dry                  # 只读不点：读数、采集点、升级候选
+  python3 coc_patrol_run.py --dry                  # 只读不点：读数、采集点、升级候选、可研究对象
   python3 coc_patrol_run.py --if-due               # 给 cron 用，没到点就静默退出（仅 OCR 后端）
   python3 coc_patrol_run.py --backend memory --dry # 内存后端空跑一轮（迁代码/验证用）
 """
@@ -141,7 +144,7 @@ def run_memory(cfg, run_dir, meta):
         auto.close()
     meta.update({k: rec.get(k) for k in
                  ("before", "after", "final", "gain", "delta", "collected", "bubbles",
-                  "builders", "n_candidates", "n_plan",
+                  "builders", "n_candidates", "n_plan", "research", "spent",
                   "candidates", "calib", "brightness", "ensure", "notes", "n_ok")
                  if rec.get(k) is not None})
     # 看板的「可升级项」读的是 items（OCR 后端填的是建筑列表行），内存后端这里换成

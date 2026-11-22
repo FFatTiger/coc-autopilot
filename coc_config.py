@@ -17,8 +17,10 @@ DEFAULTS = {
     "schedule": ["09:00", "13:00", "18:00", "22:00"],   # 北京时间，HH:MM（只对 OCR 后端生效）
     "collect": True,            # 是否收资源
     "upgrade": True,            # 是否自动升级
-    "upgrade_kinds": ["gold", "elixir"],   # 允许消耗的资源类型，dark 需显式开启
-    "max_price": 3_000_000,     # 单次升级价格上限
+    # 允许消耗的资源类型。默认只开前两种是给 OCR 后端留的保守值；
+    # 内存后端按需在 config.json 里写成 ["gold","elixir","dark"]（见 config.example.json）
+    "upgrade_kinds": ["gold", "elixir"],
+    "max_price": 3_000_000,     # 单次升级价格上限（老键：跨币种一刀切；memory 后端用下面的分币种上限）
     "max_upgrades": 1,          # OCR 后端：每轮最多升几个
     "min_free_workers": 1,      # OCR 后端：至少留几个空闲工人（1 = 有工人就升）
 
@@ -27,14 +29,35 @@ DEFAULTS = {
     "builders": 5,              # 工人总数（用来算空闲人数）
     "include_walls": False,     # 是否升城墙（默认不升）
     "include_bb": False,        # 是否包含夜世界建筑
-    "currency": "gold",        # 只升花这种货币的建筑（gold / elixir / dark / any）
+    "currency": "any",         # 只升花这种货币的建筑（gold / elixir / dark / any）
     "build_max_h": 168,         # 施工超过这么多小时还没涨级 = 当作状态失效
     "mem_cooldown_h": 24,       # 内存目标成功后多少小时不再碰
+
+    # 分币种的单次花费上限（宝石永远不在列表里，绝不参与）
+    "max_cost_gold": 3_000_000,
+    "max_cost_elixir": 6_000_000,
+    "max_cost_dark": 100_000,
+    # 先花哪种资源：圣水满仓会浪费，所以排第一；暗黑量少排第二（只够便宜档）
+    "upgrade_currency_priority": ["elixir", "dark", "gold"],
+
+    # 实验室 / 法术工厂里的「研究」（兵种 / 法术）——和「升级建筑本体」是两条路
+    "research": True,                       # 是否自动研究
+    "research_currency_priority": ["elixir", "dark", "gold"],
+    "research_min_gap_min": 30,             # 实验室空着时，最快多少分钟查一次（防反复点手机）
+    "research_max_pages": 8,                # 研究对象弹窗最多翻几页
+    "research_max_h": 240,                  # 超过这么多小时还没动静 = 当作状态失效
+    "research_alternate": True,             # 圣水/暗黑轮换着研究（实验室只有 1 个槽位）
 }
 
 KIND_CHOICES = ("gold", "elixir", "dark")
 BACKEND_CHOICES = ("ocr", "memory")
 CUR_CHOICES = ("gold", "elixir", "dark", "any")
+COST_KEYS = (("max_cost_gold", 0, 50_000_000),
+             ("max_cost_elixir", 0, 50_000_000),
+             ("max_cost_dark", 0, 10_000_000),
+             ("research_min_gap_min", 0, 1440),
+             ("research_max_pages", 1, 20),
+             ("research_max_h", 0, 720))
 
 
 def _sanitize(d):
@@ -55,7 +78,8 @@ def _sanitize(d):
                 continue
         out["schedule"] = sorted(set(clean))
 
-    for k in ("collect", "upgrade", "include_walls", "include_bb"):
+    for k in ("collect", "upgrade", "include_walls", "include_bb", "research",
+              "research_alternate"):
         if isinstance(d.get(k), bool):
             out[k] = d[k]
 
@@ -67,7 +91,14 @@ def _sanitize(d):
     if isinstance(kinds, list):
         out["upgrade_kinds"] = [k for k in kinds if k in KIND_CHOICES]
 
-    for k, lo, hi in (("max_price", 0, 50_000_000),
+    for k in ("upgrade_currency_priority", "research_currency_priority"):
+        v = d.get(k)
+        if isinstance(v, list):
+            clean = [c for c in v if c in KIND_CHOICES]
+            if clean:
+                out[k] = clean
+
+    for k, lo, hi in COST_KEYS + (("max_price", 0, 50_000_000),
                       ("max_upgrades", 0, 5),
                       ("min_free_workers", 0, 5),
                       ("max_targets", 0, 5),
