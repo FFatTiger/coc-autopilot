@@ -1266,11 +1266,19 @@ def collect(img=None, dry=False, cal=None, T=None):
             # 一轮 12 个点全打空、资源一点没收到）
             try:
                 import coc_mem_research as _r
+                import coc_mem_panel as _p
                 _im = grab()
-                _p = _r.popup_x(_im) if _im is not None else None
-                if _p:
-                    log(f"  ⚠ 采集途中冒出来挡屏弹层 @{_p}，先关掉")
-                    shell().tap(*_p, wait=1.2)
+                pp = _r.popup_x(_im) if _im is not None else None
+                if pp:
+                    log(f"  ⚠ 采集途中冒出来弹层 @{pp}，先关掉")
+                    if os.environ.get("COC_DEBUG"):
+                        cv2.imwrite("/tmp/collect_popup_%d.jpg" % int(time.time()), _im)
+                    shell().tap(*pp, wait=1.2)
+                elif _im is not None and _p.read(_im).get("open"):
+                    # 上一个点没有气泡时点到建筑上了，面板还开着。面板底部的「升级」按钮
+                    # 就在采集点附近，不关掉的话下一手可能直接点在升级上（绕过所有上限校验）
+                    log("  （上一个点开出了面板，先取消选中）")
+                    shell().tap(*dis, wait=0.35)
             except Exception:
                 pass
             shell().tap(x, y, wait=0.40)

@@ -712,8 +712,12 @@ class Research:
                 best, best_hit = got, hit
         return best
 
-    def open_research_ui(self, pan=None):
-        """点面板上的「研究」卡 → 研究弹窗"""
+    def open_research_ui(self, pan=None, allow_busy=False):
+        """点面板上的「研究」卡 → 研究弹窗
+
+        allow_busy=True 时即使认到「正在升级中」也继续（dry / 只读盘点用：那时格子照样能读，
+        只是在研究的那一格显示的是剩余时间而不是价格）。
+        """
         pan = pan or self.open_lab_panel()
         if not pan.get("open") or pan.get("research_card") is None:
             return False
@@ -728,8 +732,10 @@ class Research:
             self.log("  [research] 研究界面标题是「%s」→ 实验室在研究中" % self.ui_title)
             self.busy_from_ui = True
             self.busy_info = self.read_busy_banner(im)
-            self.close_popup(im)
-            return False
+            if not allow_busy:
+                self.close_popup(im)
+                return False
+            self.log("  [research] 只读盘点：继续读格子（正在研究的那一格显示剩余时间）")
         self.busy_from_ui = False
         self.page_cur, self.page_sigs = 0, [_sig(im)]
         self.pages = [dict(page=0, n=0, sig=self.page_sigs[0])]
@@ -1065,7 +1071,7 @@ def run(auto, res, dry=False):
                                              hours=0, at=iso_now())
                 r.save_state()
             return out
-        if not r.open_research_ui(pan):
+        if not r.open_research_ui(pan, allow_busy=dry):
             if getattr(r, "busy_from_ui", False):
                 info = getattr(r, "busy_info", {}) or {}
                 out["busy"] = "正在升级中：%s（剩下约 %s 小时）" % (
@@ -1247,9 +1253,9 @@ def dump_plan(cfg=None):
         print(json.dumps(dict(panel=dict(labels=pan.get("labels"), open=pan.get("open"),
                                          busy=pan.get("busy"), tap=pan.get("tap"))),
                          ensure_ascii=False))
-        if pan.get("busy") or not pan.get("open"):
+        if not pan.get("open"):
             return
-        if not r.open_research_ui(pan):
+        if not r.open_research_ui(pan, allow_busy=True):
             return
         tiles, pages = r.scan(im0=r.grab())
         r.enrich(tiles)
