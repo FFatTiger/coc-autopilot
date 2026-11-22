@@ -279,6 +279,15 @@ class MemAuto:
                 v["started_at"] = iso_of(ts)
                 v["started_estimated"] = not v.get("ts")   # 用巡检时间凑的才算近似
                 changed = True
+            if not v.get("type") or not v.get("from_level"):
+                # 老记录没存类型/起始等级（早期版本只存了「Wizard Tower(9→10)」这个名字）
+                m = re.match(r"^(.+?)\s*[（(]\s*(\d+)\s*(?:→|->)\s*(\d+)\s*[)）]",
+                             str(v.get("name") or ""))
+                if m:
+                    v["type"] = v.get("type") or m.group(1).strip()
+                    v["from_level"] = v.get("from_level") or int(m.group(2))
+                    v["target_level"] = v.get("target_level") or int(m.group(3))
+                    changed = True
             if not v.get("target_level"):
                 try:
                     v["target_level"] = int(k.split("|")[1]) + 1
