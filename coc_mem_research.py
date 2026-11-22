@@ -42,6 +42,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import coc_backend_mem as mem
+import coc_duration as dur
 import coc_mem_buildings as bldlib
 import coc_mem_panel as panel
 
@@ -963,13 +964,22 @@ class Research:
             self.close_confirm()
             rec["why"] = "no_title"
             return rec, res
-        # 顺带记下这次研究的时长（「升级时间 1天」），用来估算实验室什么时候空出来
-        for b in ocr_boxes(im, (1500, 900, 1900, 980)):
-            m = TIME_RE.search(b["t"])
-            if m and (m.group(1) or m.group(2)):
-                rec["time_text"] = b["t"]
-                rec["hours"] = int(m.group(1) or 0) * 24 + int(m.group(2) or 0)
+        # 顺带记下这次研究的时长（「升级时间 2天1小时53分钟」）：
+        # 实验室什么时候空出来、页面上的研究进度条，都靠这个数（±分钟级，别的不算）
+        drec = dict(text=None, seconds=None)
+        for region in ((1500, 880, 1990, 1000), (1440, 850, 2060, 1030)):
+            for b in ocr_boxes(im, region):
+                sec = dur.parse_duration(b["t"])
+                if sec:
+                    drec = dict(text=b["t"], seconds=sec)
+                    break
+            if drec["seconds"]:
                 break
+        if drec["seconds"]:
+            rec["time_text"] = drec["text"]
+            rec["duration_s"] = drec["seconds"]
+            rec["duration_text"] = drec["text"]
+            rec["hours"] = round(drec["seconds"] / 3600.0, 2)
         price, cur = self._read_btn(im, cf)
         rec["btn_price"], rec["panel_currency"] = price, cur
         grid_price = t.get("price")
@@ -1023,21 +1033,68 @@ class Research:
     def record(self):
         return (self.ast or {}).get("mem_research") or {}
 
-    def busy_reason(self):
-        """实验室是不是已经被占着（1 个槽位）：按自己的记录 + 时长估算"""
+    def archive_done(self):
+        """做完的研究从「在建」挪到「完成」历史（research_done），返回归档的那条。
+
+        两种收场：按确认页上读到的时长到期 = done；超过 research_max_h 还没动静 = expired
+        （实验室被手动取消 / 研究时长没读到，不能当成「完成」）。
+        """
         r = self.record()
         if not r:
             return None
         try:
-            ts, hours = float(r.get("ts") or 0), float(r.get("hours") or 0)
+            ts = float(r.get("started_ts") or r.get("ts") or 0)
+            done_s = float(r.get("duration_s") or 0) or float(r.get("hours") or 0) * 3600
         except Exception:
-            ts, hours = 0, 0
-        age_h = (time.time() - ts) / 3600.0
+            ts, done_s = 0, 0
+        age = (time.time() - ts) if ts else 0
+        max_s = float(self.opt("research_max_h", 240) or 240) * 3600
+        if done_s and age >= done_s:
+            kind = "done"
+        elif age >= max_s:
+            kind = "expired"
+        else:
+            return None
+        hist = self.ast.get("research_done") or []
+        hist.append(dict(kind=kind, at=iso_now(), ts=int(time.time()),
+                         name=r.get("name"), from_level=r.get("from_level"),
+                         to_level=r.get("to_level"),
+                         started_ts=int(ts) if ts else None,
+                         started_at=r.get("started_at"),
+                         duration_s=int(done_s) if done_s else None,
+                         duration_text=r.get("duration_text"),
+                         actual_s=int(age), cost=r.get("paid"),
+                         currency=r.get("currency"),
+                         estimated=bool(r.get("started_estimated") or r.get("duration_estimated"))))
+        self.ast["research_done"] = hist[-40:]
+        self.ast.pop("mem_research", None)
+        self.save_state()
+        self.log("  [research] 归档上一笔研究：%s（%s，实际 %s）" % (
+            hist[-1].get("name"), kind, dur.fmt_duration(age)))
+        return hist[-1]
+
+    def busy_reason(self):
+        """实验室是不是已经被占着（1 个槽位）：按自己的记录 + 时长估算
+
+        时长优先用 duration_s（确认页上读到的秒数，精确到分钟），老记录只有 hours。
+        过了时长就把这条归档到 research_done（页面上的「完成」历史读它）。
+        """
+        r = self.record()
+        if not r:
+            return None
+        try:
+            ts = float(r.get("started_ts") or r.get("ts") or 0)
+            done_s = float(r.get("duration_s") or 0) or float(r.get("hours") or 0) * 3600
+        except Exception:
+            ts, done_s = 0, 0
+        age = time.time() - ts
         max_h = float(self.opt("research_max_h", 240) or 240)
-        if hours and age_h < hours:
-            return "%s（已过 %.1f/%.1f 小时）" % (r.get("name"), age_h, hours)
-        if not hours and age_h < max_h:
-            return "%s（已过 %.1f 小时，时长未知）" % (r.get("name"), age_h)
+        if done_s and age < done_s:
+            return "%s（已过 %s / 共 %s）" % (r.get("name"), dur.fmt_duration(age),
+                                            dur.fmt_duration(done_s))
+        if not done_s and age < max_h * 3600:
+            return "%s（已过 %.1f 小时，时长未知）" % (r.get("name"), age / 3600.0)
+        self.archive_done()      # 到点了：从「在建」挪进「完成」历史
         return None
 
 
@@ -1117,11 +1174,18 @@ def run(auto, res, dry=False):
         if rec.get("alert"):
             out["alerts"].append(rec["alert"])
         if rec.get("ok"):
+            r.archive_done()     # 上一笔（已经到期但没归档的）先挪走，别被覆盖掉
+            started = int(time.time())
             r.ast["mem_research"] = dict(
                 name=rec.get("name"), from_level=rec.get("level"),
                 to_level=rec.get("target_level"), price=rec.get("panel_price"),
-                currency=rec.get("panel_currency"), ts=int(time.time()),
-                hours=rec.get("hours") or 0, at=iso_now(), paid=rec.get("paid"))
+                currency=rec.get("panel_currency"), ts=started,
+                started_ts=started, started_at=iso_now(), started_estimated=False,
+                hours=rec.get("hours") or 0,
+                duration_s=rec.get("duration_s"), duration_text=rec.get("duration_text"),
+                duration_source=("confirm_panel" if rec.get("duration_s") else None),
+                duration_estimated=False,
+                at=iso_now(), paid=rec.get("paid"))
             r.save_state()
             auto.log("  [research] ✓ %s 升到 %s 级，扣 %s（面板 %s %s，匹配 %s）" % (
                 rec.get("name"), rec.get("target_level"), rec.get("paid"),

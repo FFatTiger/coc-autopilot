@@ -3,6 +3,7 @@
 
 单文件、零依赖（标准库 http.server），供 PM2 常驻。
 """
+import base64
 import json
 import os
 import re
@@ -12,6 +13,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import coc_config
+import coc_progress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -21,10 +23,53 @@ PORT = int(os.environ.get("COC_PORT") or 8899)   # 同一台机跑第二份看�
 MAX_RUNS = 200
 BACKEND_LABELS = {"ocr": "OCR 后端", "memory": "内存后端"}
 
+ROOT = os.path.dirname(os.path.abspath(__file__))
+ICON_DIR = os.path.join(ROOT, "static", "icons")      # tools/icons_build.py 生成
+
 RUN_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "coc_patrol_run.py")
 PYTHON = os.environ.get("COC_PYTHON") or sys.executable
 RUN_LOG = "/tmp/coc_manual_run.log"
 _proc = {"p": None, "started": None}
+
+_icons_cache = {"at": 0, "data": {}}
+
+
+def icon_map():
+    """static/icons/*.png → {名字: data URI}，进程内缓存（文件改了 mtime 才重读）。
+
+    内嵌的用意：页面必须离线可开，一个外部请求都不能有（也不走 CDN）。
+    """
+    try:
+        files = sorted(f for f in os.listdir(ICON_DIR) if f.endswith(".png"))
+    except OSError:
+        return {}
+    stamp = 0
+    for f in files:
+        try:
+            stamp = max(stamp, os.path.getmtime(os.path.join(ICON_DIR, f)))
+        except OSError:
+            pass
+    if _icons_cache["data"] and _icons_cache["at"] == stamp:
+        return _icons_cache["data"]
+    out = {}
+    for f in files:
+        try:
+            with open(os.path.join(ICON_DIR, f), "rb") as fh:
+                raw = fh.read()
+        except OSError:
+            continue
+        out[f[:-4]] = "data:image/png;base64," + base64.b64encode(raw).decode()
+    _icons_cache.update(at=stamp, data=out)
+    return out
+
+
+def state_payload():
+    """「正在升级」这一块的数据：状态文件里那部分 + 服务器当前时间"""
+    cfg = coc_config.load()
+    return coc_progress.build(total_builders=cfg.get("builders", 5),
+                              build_max_h=cfg.get("build_max_h", 168),
+                              research_max_h=cfg.get("research_max_h", 240))
+
 
 PAGE = """<!doctype html>
 <html lang="zh-CN">
@@ -49,6 +94,8 @@ PAGE = """<!doctype html>
     --info:#4338ca; --info-bg:#e0e7ff; --info-bd:#e0e7ff;
     --accent:#1b1d21; --on-accent:#fff;
     --live-bg:#f0fdf4; --live-bd:#dcfce7; --live-ink:#166534; --live-pre:#fff; --live-spin:#bbf7d0;
+    --track:#eef0f3; --track-2:#e3e6ea; --bar:#f0a92c; --bar-2:#f7c65b;
+    --lab:#7c3aed; --lab-bg:#f6f2ff; --lab-bd:#e7dcff; --lab-bar:#a78bfa;
     --toast-bg:#1b1d21; --toast-ink:#fff;
     --shadow:0 2px 10px rgba(0,0,0,.22);
     --r:16px; --r-sm:10px;
@@ -66,6 +113,8 @@ PAGE = """<!doctype html>
       --info:#a5b4fc; --info-bg:#1e2340; --info-bd:#2c3462;
       --accent:#e7eaee; --on-accent:#14171c;
       --live-bg:#12261b; --live-bd:#1e3d2b; --live-ink:#86efac; --live-pre:#0c130f; --live-spin:#1e3d2b;
+      --track:#242a32; --track-2:#2c333c; --bar:#f0b03a; --bar-2:#f7cd6a;
+      --lab:#c4b5fd; --lab-bg:#1d1a2b; --lab-bd:#322b48; --lab-bar:#8b5cf6;
       --toast-bg:#e7eaee; --toast-ink:#14171c;
       --shadow:0 2px 12px rgba(0,0,0,.55);
     }
@@ -222,6 +271,81 @@ PAGE = """<!doctype html>
          transition:opacity .2s;z-index:60;pointer-events:none;max-width:calc(100% - 32px);text-align:center}
   .toast.on{opacity:1}
 
+  /* ---------------- 正在升级（在建） ---------------- */
+  .upg{margin-top:22px}
+  .upg-head{display:flex;align-items:center;justify-content:space-between;gap:12px;
+       margin:0 0 11px;flex-wrap:wrap}
+  .upg-head h2{margin:0}
+  .upg-chips{display:flex;gap:7px;flex-wrap:wrap}
+  .kchip{display:inline-flex;align-items:center;gap:5px;padding:3px 10px 3px 7px;border-radius:999px;
+       background:var(--chip-bg);color:var(--ink-2);font-size:12px;line-height:1.5;
+       font-variant-numeric:tabular-nums;white-space:nowrap}
+  .kchip b{color:var(--ink);font-weight:600}
+  .kchip img,.kchip svg{width:13px;height:13px;display:block;opacity:.95}
+  .upg-list{display:grid;gap:9px}
+  .upg-row{display:grid;grid-template-columns:38px minmax(0,1fr) auto;align-items:center;
+       gap:14px;background:var(--card);border:1px solid var(--line);border-radius:15px;
+       padding:12px 16px 12px 14px;position:relative;overflow:hidden}
+  .upg-row.research{border-color:var(--lab-bd);background:var(--lab-bg)}
+  .upg-ic{width:38px;height:38px;border-radius:11px;overflow:hidden;flex:none;position:relative;
+       background:var(--surface-3);display:grid;place-items:center}
+  .upg-ic img{width:100%;height:100%;object-fit:cover;display:block}
+  .upg-ic svg{width:22px;height:22px;display:block}
+  .upg-ic.fallback{border-radius:11px;font-size:14px;font-weight:600;color:#fff;
+       background:linear-gradient(160deg, hsl(var(--h) 64% 60%), hsl(var(--h) 64% 42%));
+       display:grid;place-items:center;letter-spacing:-.3px;
+       box-shadow:inset 0 1px 0 rgba(255,255,255,.28), inset 0 -2px 6px rgba(0,0,0,.14);
+       text-shadow:0 1px 1px rgba(0,0,0,.18)}
+  .upg-body{min-width:0}
+  .upg-l1{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-bottom:7px}
+  .upg-name{font-weight:600;font-size:14.5px;letter-spacing:-.1px;white-space:nowrap;
+       overflow:hidden;text-overflow:ellipsis;max-width:100%}
+  .upg-lv{display:inline-flex;align-items:center;gap:3px;font-size:12px;color:var(--ink-2);
+       font-variant-numeric:tabular-nums;background:var(--chip-bg);border-radius:999px;padding:1px 8px}
+  .upg-lv b{color:var(--ink);font-weight:600}
+  .upg-lv i{color:var(--ink-3);font-style:normal}
+  .upg-flag{font-size:11.5px;color:var(--warn);background:var(--warn-bg);
+       border:1px solid var(--warn-bd);border-radius:999px;padding:0 7px;line-height:1.55}
+  .upg-track-wrap{display:flex;align-items:center;gap:7px;margin:2px 0 8px}
+  .upg-track-wrap .cap{flex:none;width:15px;height:15px;opacity:.85;display:grid;place-items:center}
+  .upg-track-wrap .cap svg{width:15px;height:15px;display:block}
+  .upg-track-wrap .cap.end{opacity:.5}
+  .upg-track{position:relative;flex:1 1 auto;height:9px;border-radius:999px;
+       background:var(--track);margin:0}
+  .upg-row.nodur .upg-track{background-image:repeating-linear-gradient(115deg,
+       var(--track-2) 0 6px, transparent 6px 12px);background-color:var(--track)}
+  .upg-row.nodur .upg-time b{color:var(--ink-2);font-weight:500;font-size:15px}
+  .upg-row.nodur .cap.end{opacity:.28}
+  .upg-track .fill{position:absolute;left:0;top:0;bottom:0;border-radius:999px;
+       background:linear-gradient(90deg,var(--bar),var(--bar-2));transition:width .6s ease}
+  .upg-row.research .upg-track .fill{background:linear-gradient(90deg,var(--lab-bar),var(--lab))}
+  .upg-track .fill.done{background:linear-gradient(90deg,var(--ok),#4ade80)}
+  .upg-track .knob{position:absolute;top:50%;width:16px;height:16px;border-radius:50%;
+       background:var(--card);border:2px solid var(--bar);transform:translate(-50%,-50%);
+       box-shadow:0 1px 3px rgba(0,0,0,.18);transition:left .6s ease;z-index:2}
+  .upg-row.research .upg-track .knob{border-color:var(--lab-bar)}
+  .upg-l2{display:flex;align-items:center;gap:6px 12px;flex-wrap:wrap;font-size:12px;
+       color:var(--ink-2);font-variant-numeric:tabular-nums}
+  .upg-l2 .k{display:inline-flex;align-items:center;gap:4px;white-space:nowrap}
+  .upg-l2 img{width:13px;height:13px;display:block}
+  .upg-l2 .pct{color:var(--ink);font-weight:600}
+  .upg-time{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
+  .upg-time b{display:block;font-size:16px;font-weight:600;letter-spacing:-.2px;line-height:1.25}
+  .upg-time span{font-size:11.5px;color:var(--ink-3)}
+  .upg-row.done{border-color:var(--ok-bd);background:var(--ok-bg)}
+  .upg-row.done .upg-time b{color:var(--ok)}
+  .upg-empty{display:flex;align-items:center;gap:12px;color:var(--ink-2);font-size:13.5px;
+       background:var(--card);border:1px dashed var(--line);border-radius:15px;padding:16px}
+  .upg-empty svg{width:22px;height:22px;opacity:.5;flex:none}
+  .card .k img.cic{width:17px;height:17px;display:block;margin-top:-1px}
+  .card .k svg{width:15px;height:15px;display:block;opacity:.75}
+  /* 历史表里的状态：图标 + 极短标注 */
+  .st{display:inline-flex;align-items:center;gap:5px;font-size:12px;color:var(--ink-2);white-space:nowrap}
+  .st svg{width:16px;height:16px;display:block}
+  .st.ok{color:var(--ok)} .st.bad{color:var(--bad)} .st.warn{color:var(--warn)}
+  .cur{display:inline-flex;align-items:center;gap:5px;white-space:nowrap}
+  .cur img{width:15px;height:15px;display:inline-block;vertical-align:-3px}
+
   @media (hover:hover){
     .bar:hover{opacity:1}
     tbody tr[data-id]:hover td{background:var(--surface-2)}
@@ -307,6 +431,25 @@ PAGE = """<!doctype html>
     .cmp-nums{flex:0 1 auto;flex-direction:column;gap:2px;font-size:12.5px}
     .shots{grid-template-columns:1fr}
     .item{font-size:12px;padding:5px 10px}
+    /* 在建：手机上把「剩余」挪到名字右边那行，进度条整行铺满 */
+    .upg{margin-top:18px}
+    .upg-head{margin-bottom:9px;gap:8px}
+    .upg-chips{gap:6px}
+    .kchip{font-size:11.5px;padding:2px 9px 2px 6px}
+    .upg-row{grid-template-columns:34px minmax(0,1fr);gap:11px;padding:11px 12px;
+         border-radius:13px}
+    .upg-ic{width:34px;height:34px;border-radius:10px}
+    .upg-l1{margin-bottom:6px;gap:6px}
+    .upg-name{font-size:14px}
+    .upg-lv{font-size:11.5px;padding:0 7px}
+    .upg-time{grid-column:1/-1;display:flex;align-items:baseline;justify-content:space-between;
+         gap:8px;margin-top:2px;padding-top:7px;border-top:1px solid var(--line)}
+    .upg-row.done .upg-time{border-top-color:var(--ok-bd)}
+    .upg-time b{font-size:15px}
+    .upg-time span{font-size:11.5px;order:2}
+    .upg-row.research .upg-time{border-top-color:var(--lab-bd)}
+    .upg-l2{gap:4px 10px;font-size:11.5px}
+    .upg-empty{padding:14px;font-size:13px}
     /* 设置：底部抽屉 + 拇指区按钮 + 16px 输入框（防 iOS 自动放大） */
     .mask{align-items:flex-end;justify-content:stretch;padding:0}
     .sheet{max-width:none;width:100%;border-radius:20px 20px 0 0;border-bottom:0;
@@ -360,6 +503,14 @@ PAGE = """<!doctype html>
   </div>
 
   <div class="grid cards" id="cards"></div>
+
+  <section class="section upg" id="upgSec">
+    <div class="upg-head">
+      <h2>正在升级</h2>
+      <div class="upg-chips" id="upgChips"></div>
+    </div>
+    <div class="upg-list" id="upgList"></div>
+  </section>
 
   <div class="live" id="live">
     <div class="row"><span class="spinner"></span><span id="liveText">正在运行巡检…</span></div>
@@ -536,15 +687,6 @@ let SHOWN = 0;
 let OPEN_ID = null;
 let OPEN_REQ = new URLSearchParams(location.search).get('open');
 
-function statusPill(s){
-  if (s === 'ok') return '<span class="pill ok">完成</span>';
-  if (s === 'failed') return '<span class="pill bad">失败</span>';
-  if (s === 'error') return '<span class="pill bad">异常</span>';
-  if (s === 'interrupted') return '<span class="pill warn">中断</span>';
-  if (s === 'running') return '<span class="pill warn">运行中</span>';
-  return '<span class="pill warn">' + esc(s) + '</span>';
-}
-
 function renderBars(){
   const hist = RUNS.slice(0, barCount()).reverse();
   const vals = hist.map(r => ((r.gain||{}).gold) || 0);
@@ -636,16 +778,18 @@ function render(runs){
   const wk = latest.workers || [null, null];
   // read_workers() 返回的是 (空闲, 总数)：0/5 表示全在忙，不是全空闲
   const free = (wk[0] !== null && wk[1] !== null) ? wk[0] : null;
+  const kIcon = (name, label) =>
+    `<div class="k">${ic(name, 'cic')}<span>${label}</span></div>`;
   c.innerHTML = `
-    <div class="card"><div class="k"><i class="dot gold"></i>金币</div><div class="v">${fmt(res.gold)}
+    <div class="card">${kIcon('gold', '金币')}<div class="v">${fmt(res.gold)}
       <small>${dlt((latest.gain||{}).gold)}</small></div></div>
-    <div class="card"><div class="k"><i class="dot elixir"></i>圣水</div><div class="v">${fmt(res.elixir)}
+    <div class="card">${kIcon('elixir', '圣水')}<div class="v">${fmt(res.elixir)}
       <small>${dlt((latest.gain||{}).elixir)}</small></div></div>
-    <div class="card"><div class="k"><i class="dot dark"></i>暗黑重油</div><div class="v">${fmt(res.dark)}
+    <div class="card">${kIcon('dark', '暗黑重油')}<div class="v">${fmt(res.dark)}
       <small>${dlt((latest.gain||{}).dark)}</small></div></div>
-    <div class="card"><div class="k">空闲工人</div><div class="v">${free === null ? '—' : free}
+    <div class="card"><div class="k">${SVG.worker}<span>空闲工人</span></div><div class="v">${free === null ? '—' : free}
       <small>/ ${wk[1] ?? '—'}</small></div></div>
-    <div class="card"><div class="k">胜利之星</div><div class="v">${latest.star ?? '—'}
+    <div class="card"><div class="k">${SVG.star}<span>胜利之星</span></div><div class="v">${latest.star ?? '—'}
       <small>/ 5</small></div></div>`;
 
   renderBars();
@@ -750,9 +894,10 @@ function toggle(tr, run){
   const bef = run.before || {};
   const afl = run.final || run.after || {};
   const items = (run.items || []).map(i =>
-    `<span class="item">${esc(i.name)} · ${fmt(i.price)} ${i.kind === 'gold' ? '金币' : i.kind === 'elixir' ? '圣水' : i.kind === 'dark' ? '暗黑' : '未知'}</span>`).join('');
-  const up = run.upgrade ? `<div class="items"><span class="item up">
-     已升级 ${esc(run.upgrade.name)} · ${fmt(run.upgrade.price)}</span></div>` : '';
+    `<span class="item">${esc(i.name)} · ${fmt(i.price)}${ic(i.kind)}</span>`).join('');
+  const upPaid = (run.upgrade && run.upgrade.paid) ? Object.keys(run.upgrade.paid)[0] : null;
+  const up = run.upgrade ? `<div class="items"><span class="item up">${SVG.check}
+     已升级 ${esc(run.upgrade.name)} · ${fmt(run.upgrade.price)}${ic(upPaid)}</span></div>` : '';
   const rsc = run.research || {};
   const rres = rsc.result || {};
   const rtxt = rres.ok
@@ -777,8 +922,9 @@ function toggle(tr, run){
       </div>
       <div class="cmp-bar">
         <div class="cmp-nums">
-          <span>金币 ${fmt(bef.gold)} → ${fmt(afl.gold)}</span>
-          <span>圣水 ${fmt(bef.elixir)} → ${fmt(afl.elixir)}</span>
+          <span class="cur">${ic('gold')}${fmt(bef.gold)} → ${fmt(afl.gold)}</span>
+          <span class="cur">${ic('elixir')}${fmt(bef.elixir)} → ${fmt(afl.elixir)}</span>
+          <span class="cur">${ic('dark')}${fmt(bef.dark)} → ${fmt(afl.dark)}</span>
         </div>
         <button class="btn tiny" type="button" data-cmp-toggle>上下两张</button>
       </div>
@@ -969,6 +1115,201 @@ async function startRun(){
   pollRun();
 }
 
+// ---------------- 图标 ----------------
+const ICONS = (window.__BOOT__ && window.__BOOT__.icons) || {};
+const CURS = {gold: '金币', elixir: '圣水', dark: '暗黑', gems: '宝石'};
+function ic(name, cls){
+  const src = ICONS[name];
+  return src ? `<img class="${cls || ''}" src="${src}" alt="${CURS[name] || ''}">` : '';
+}
+// 建建筑图标：先找真素材（static/icons/b_类型.png），没有再退回「按类型着色的圆角块 + 首字母」
+function iconFor(type, size){
+  const key = 'b_' + String(type || '').split(' ').join('_');
+  if (ICONS[key]) return `<span class="upg-ic"><img src="${ICONS[key]}" alt=""></span>`;
+  let h = 200;
+  for (const ch of String(type || '?')) h = (h * 31 + ch.charCodeAt(0)) % 360;
+  const t = String(type || '?');
+  // 中文取前两个字（「加农炮」→「加农」），英文取首字母（Cannon → C）
+  const initial = /[\u4e00-\u9fff]/.test(t) ? t.slice(0, 2) : t.slice(0, 1).toUpperCase();
+  return `<span class="upg-ic fallback" style="--h:${h}" title="${esc(t)}（暂无该建筑的图标）">${esc(initial)}</span>`;
+}
+// 手绘 SVG（游戏风：圆角 + 深描边），不用 emoji
+const SVG = {
+  flask: '<svg viewBox="0 0 24 24" fill="none"><path d="M9.2 2.6h5.6M10.4 2.8v6.1L5.9 17.2A2.6 2.6 0 0 0 8.2 21h7.6a2.6 2.6 0 0 0 2.3-3.8L13.6 8.9V2.8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><path d="M8.1 15.4h7.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><circle cx="10.6" cy="18" r="1.15" fill="currentColor" opacity=".7"/><circle cx="13.7" cy="18.4" r=".85" fill="currentColor" opacity=".55"/></svg>',
+  hammer: '<svg viewBox="0 0 24 24"><g transform="rotate(-38 12 12)"><rect x="9.5" y="3.2" width="5" height="8.2" rx="1.3" fill="#dce1e9" stroke="#4a525d" stroke-width="1.5"/><rect x="11" y="10.4" width="2" height="10.4" rx="1" fill="#b9793f" stroke="#7a4a22" stroke-width="1.3"/></g></svg>',
+  worker: '<svg viewBox="0 0 24 24" fill="none"><path d="M4.6 20.4c0-3.6 2.9-5.6 7.4-5.6s7.4 2 7.4 5.6" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/><circle cx="12" cy="8.4" r="3.5" fill="currentColor" opacity=".85"/><path d="M7.6 6.2h8.8a1.4 1.4 0 0 0 0-2.8H7.6a1.4 1.4 0 0 0 0 2.8z" fill="currentColor" opacity=".55"/></svg>',
+  check: '<svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9.2" fill="#16a34a" opacity=".14"/><path d="m7.4 12.4 3.2 3.2 6.2-6.6" stroke="#16a34a" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  clock: '<svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="8.6" stroke="#d97706" stroke-width="2"/><path d="M12 7.6V12l3.1 2" stroke="#d97706" stroke-width="2" stroke-linecap="round"/></svg>',
+  x: '<svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9.2" fill="#dc2626" opacity=".13"/><path d="m8.4 8.4 7.2 7.2M15.6 8.4l-7.2 7.2" stroke="#dc2626" stroke-width="2.3" stroke-linecap="round"/></svg>',
+  dot: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.6" fill="currentColor"/></svg>',
+  star: '<svg viewBox="0 0 24 24"><path d="M12 3.2l2.7 5.6 6.1.9-4.4 4.3 1 6.1-5.4-2.9-5.4 2.9 1-6.1L3.2 9.7l6.1-.9z" fill="#f0b03a" stroke="#c2820f" stroke-width="1.1" stroke-linejoin="round"/></svg>',
+  brick: '<svg viewBox="0 0 24 24" fill="none"><rect x="3" y="7" width="18" height="10" rx="2.4" stroke="currentColor" stroke-width="1.7"/><path d="M3 11.6h18M9 7v4.6M15 11.6V17" stroke="currentColor" stroke-width="1.5"/></svg>'
+};
+
+// 状态 → 图标 + 极短标注（不写 ok/timeout/failed 这种词）
+function statusPill(s){
+  if (s === 'ok') return `<span class="st ok" title="完成">${SVG.check}<span>完成</span></span>`;
+  if (s === 'failed' || s === 'error') return `<span class="st bad" title="失败">${SVG.x}<span>失败</span></span>`;
+  if (s === 'interrupted') return `<span class="st warn" title="中断">${SVG.clock}<span>中断</span></span>`;
+  if (s === 'running') return `<span class="st warn" title="运行中">${SVG.clock}<span>运行中</span></span>`;
+  return `<span class="st warn">${SVG.dot}<span>${esc(s)}</span></span>`;
+}
+
+// ---------------- 正在升级（时间推算 + 本地每秒倒数） ----------------
+let ST = null;          // /api/state 最近一份
+let ST_SKEW = 0;        // 服务器时间 - 本机时间（毫秒）
+const MM_NARROW_ICON = window.matchMedia('(max-width: 640px)');
+
+function pad2(n){ return String(n).padStart(2, '0'); }
+function hhmm(ts){
+  if (!ts) return '—';
+  const d = new Date(ts * 1000);
+  if (isNaN(d)) return '—';
+  return `${pad2(d.getMonth()+1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+function fmtLeft(sec){
+  if (sec === null || sec === undefined) return '—';
+  sec = Math.max(0, Math.round(sec));
+  if (sec < 60) return sec + '秒';
+  const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600),
+        m = Math.floor((sec % 3600) / 60);
+  if (d) return d + '天' + h + '小时';
+  if (h) return h + '小时' + m + '分';
+  return m + '分';
+}
+function num(n){ return (n === null || n === undefined) ? '—' : Number(n).toLocaleString('zh-CN'); }
+
+function serverNow(){ return (Date.now() + ST_SKEW) / 1000; }
+
+function calcItem(it, now){
+  const started = it.started_ts, dur = it.duration_s;
+  const elapsed = started ? (now - started) : null;
+  const remaining = (dur && elapsed !== null) ? Math.max(0, dur - elapsed) : null;
+  const prog = (dur && elapsed !== null) ? Math.min(1, Math.max(0, elapsed / dur)) : null;
+  return {elapsed, remaining, prog};
+}
+
+function upgRow(it){
+  const isLab = it.kind === 'research';
+  const lv = (it.from_level && it.to_level)
+    ? `<span class="upg-lv"><b>${it.from_level}</b><i>→</i><b>${it.to_level}</b></span>` : '';
+  const flag = it.estimated ? '<span class="upg-flag" title="开始时间/时长有一个是推算的">时间近似</span>' : '';
+  const noDur = it.duration_s ? '' : '<span class="upg-flag" title="这一笔开工时没读到面板时长（老记录），只能看已过时间">时长未知</span>';
+  const icon = isLab ? `<span class="upg-ic" style="color:var(--lab)">${SVG.flask}</span>` : iconFor(it.type);
+  const cost = it.cost ? `<span class="k">${ic(it.currency)}${num(it.cost)}</span>` : '';
+  return `<div class="upg-row ${isLab ? 'research' : ''}" data-k="${esc(it.key)}">
+    ${icon}
+    <div class="upg-body">
+      <div class="upg-l1">
+        <span class="upg-name">${esc(isLab ? (it.name || '研究') : it.type)}</span>
+        ${lv}${flag}${noDur}
+      </div>
+      <div class="upg-track-wrap">
+        <span class="cap start" title="开工">${SVG.hammer}</span>
+        <div class="upg-track">
+          <span class="fill"></span><span class="knob"></span>
+        </div>
+        <span class="cap end" title="完成">${SVG.check}</span>
+      </div>
+      <div class="upg-l2">
+        <span class="pct"></span>
+        <span class="k" data-k="elapsed"></span>
+        <span class="k" data-k="total"></span>
+        ${cost}
+        <span class="k" data-k="start"></span>
+      </div>
+    </div>
+    <div class="upg-time"><b></b><span>剩余</span></div>
+  </div>`;
+}
+
+function chipsHTML(st){
+  const b = `<span class="kchip" title="工人在施工">${SVG.hammer}<b>${st.busy}/${st.total}</b> 工人</span>`;
+  const lab = st.research
+    ? `<span class="kchip" style="color:var(--lab)" title="实验室在研究中">${SVG.flask}<b>研究中</b></span>`
+    : `<span class="kchip" title="实验室空闲">${SVG.flask}<b>空闲</b></span>`;
+  return b + lab;
+}
+
+function renderUpg(){
+  const list = document.getElementById('upgList');
+  const chips = document.getElementById('upgChips');
+  if (!list) return;
+  const st = ST;
+  if (!st){ return; }
+  if (chips) chips.innerHTML = chipsHTML(st);
+  const items = st.items || [];
+  if (!items.length){
+    list.innerHTML = `<div class="upg-empty">${SVG.hammer}<div>工人全空闲 · 没有在建<br>
+      <span style="color:var(--ink-3);font-size:12.5px">下一轮巡检有合适的项目就开工</span></div></div>`;
+    return;
+  }
+  list.innerHTML = items.map(upgRow).join('');
+  tickUpg();
+}
+
+function tickUpg(){
+  if (!ST) return;
+  const now = serverNow();
+  const list = document.getElementById('upgList');
+  if (!list) return;
+  for (const it of (ST.items || [])){
+    const row = list.querySelector(`.upg-row[data-k="${CSS.escape(it.key)}"]`);
+    if (!row) continue;
+    const {elapsed, remaining, prog} = calcItem(it, now);
+    const fill = row.querySelector('.fill');
+    const knob = row.querySelector('.knob');
+    if (prog === null){
+      fill.style.width = '0%';
+      fill.style.opacity = '';
+      fill.classList.remove('done');
+      row.classList.add('nodur');
+      knob.style.display = 'none';
+    } else {
+      row.classList.remove('nodur');
+      fill.style.opacity = '';
+      fill.style.width = (prog * 100).toFixed(2) + '%';
+      knob.style.display = '';
+      knob.style.left = (prog * 100).toFixed(2) + '%';
+      fill.classList.toggle('done', !!remaining === false || remaining === 0);
+    }
+    const big = row.querySelector('.upg-time b');
+    const small = row.querySelector('.upg-time span');
+    const overdue = it.duration_s && remaining === 0;
+    row.classList.toggle('done', !!overdue);
+    if (overdue){
+      big.textContent = '已完成';
+      small.textContent = '等下一轮确认';
+    } else if (remaining === null){
+      big.textContent = fmtLeft(elapsed);
+      small.textContent = '已过 · 时长未知';
+    } else {
+      big.textContent = fmtLeft(remaining);
+      small.textContent = '剩余';
+    }
+    const pct = row.querySelector('.pct');
+    if (pct) pct.textContent = prog === null ? '' : Math.round(prog * 100) + '%';
+    const set = (k, v) => { const el = row.querySelector(`[data-k="${k}"]`); if (el) el.innerHTML = v; };
+    set('elapsed', it.duration_s ? `${SVG.dot}已过 ${fmtLeft(elapsed)}` : '');
+    set('total', it.duration_s ? `${SVG.dot}共 ${fmtLeft(it.duration_s)}` : '');
+    set('start', it.started_ts ? `${SVG.dot}开始 ${hhmm(it.started_ts)}` : '');
+  }
+}
+
+async function loadState(){
+  try{
+    const r = await fetch('/api/state', {cache: 'no-store'});
+    if (!r.ok) throw new Error('state ' + r.status);
+    const d = await r.json();
+    ST = d;
+    ST_SKEW = (d.now * 1000) - Date.now();
+    renderUpg();
+  }catch(e){
+    const sub = document.getElementById('sub');
+    if (sub && !ST) sub.textContent = '在建状态读取失败：' + e.message;
+  }
+}
+
 function bootRender(){
   if (window.__BOOT__ && window.__BOOT__.runs) render(window.__BOOT__.runs);
 }
@@ -999,9 +1340,17 @@ bind('mask', 'click', function(e){
 document.addEventListener('keydown', function(e){ if (e.key === 'Escape') closeCfg(); });
 
 if (window.__BOOT__ && window.__BOOT__.config) setBadge(window.__BOOT__.config.backend);
+if (window.__BOOT__ && window.__BOOT__.state){
+  ST = window.__BOOT__.state;
+  ST_SKEW = (ST.now * 1000) - Date.now();
+  renderUpg();
+}
 bootRender();
 load();
+loadState();
 setInterval(load, 60000);
+setInterval(loadState, 30000);      // 只刷「在建」这一块，不整页刷新
+setInterval(tickUpg, 1000);         // 倒计时本地每秒走，不打扰后端
 
 // 页面刷新后如果后端还在跑，自动接上进度
 fetch('/api/run/status').then(r => r.json()).then(st => {
@@ -1096,7 +1445,8 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path in ("/", "/index.html"):
             cfg = coc_config.load()
-            boot = json.dumps({"runs": load_runs(), "config": cfg},
+            boot = json.dumps({"runs": load_runs(), "config": cfg,
+                               "icons": icon_map(), "state": state_payload()},
                               ensure_ascii=False).replace("</", "<\\/")
             # 后端徽标服务端先渲染一次，页面还没跑 JS 时也能看出当前是哪个后端
             html = PAGE.replace("__BACKEND_LABEL__",
@@ -1114,6 +1464,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/runs":
             return self._send(200, json.dumps(load_runs(), ensure_ascii=False))
+        if path == "/api/state":
+            try:
+                return self._send(200, json.dumps(state_payload(), ensure_ascii=False))
+            except Exception as e:
+                return self._send(500, json.dumps(
+                    {"error": "%s: %s" % (type(e).__name__, e)}, ensure_ascii=False))
         if path == "/api/config":
             return self._send(200, json.dumps(coc_config.load(), ensure_ascii=False))
         if path == "/api/run/status":

@@ -22,6 +22,7 @@ import argparse
 import datetime
 import json
 import os
+import re
 import sys
 import time
 
@@ -39,10 +40,30 @@ LOGD = os.path.join(HERE, "logs")                   # 证据图（面板 / 确�
 
 DIM_TH = 70.0          # 画面平均亮度低于这个 = 有模态框
 RECONNECT = [1105, 926]  # 「重新载入游戏」（UI 固定坐标，不随镜头变）
+JPG_MATCH_S = 240      # 回填时长时，确认页截图和这笔升级的时间戳最多差这么多秒
 
 
 def iso_now():
     return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def iso_of(ts):
+    """epoch → 本地 ISO；拿不到就 None（页面靠 started_ts 算，ISO 只是给人看的）"""
+    try:
+        return datetime.datetime.fromtimestamp(float(ts)).astimezone().isoformat(
+            timespec="seconds")
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def parse_iso_ts(s):
+    """ISO 字符串 → epoch（老记录里 last_round.ts 是 ISO，不是数字）"""
+    if not s:
+        return None
+    try:
+        return int(datetime.datetime.fromisoformat(str(s)).timestamp())
+    except (TypeError, ValueError):
+        return None
 
 
 def jload(p, d=None):
@@ -160,7 +181,148 @@ class MemAuto:
                 return True, time.time() - t0, im
         return False, time.time() - t0, mem.grab()
 
-    # ---------------- 工人 ----------------
+    # ---------------- 在建（工人 / 实验室共用的记录视图） ----------------
+    def _upgrade_view(self, k, v, now_lv, tnow, max_h):
+        """一条在建记录 → 页面/日志要的字段（进度、剩余、时间是否近似）"""
+        try:
+            nm, lv, _pos = k.split("|")
+            lv = int(float(lv))
+        except Exception:
+            nm, lv = v.get("type") or v.get("name") or k, None
+        started = v.get("started_ts") or v.get("ts") or None
+        try:
+            started = int(float(started)) if started else None
+        except (TypeError, ValueError):
+            started = None
+        dur_s = v.get("duration_s")
+        try:
+            dur_s = int(float(dur_s)) if dur_s else None
+        except (TypeError, ValueError):
+            dur_s = None
+        age = (tnow - started) if started else None
+        item = dict(
+            key=k, type=nm, name=v.get("name") or nm,
+            from_level=lv, to_level=v.get("target_level") or (lv + 1 if lv is not None else None),
+            now_level=now_lv,
+            started_ts=started, started_at=v.get("started_at") or iso_of(started),
+            duration_s=dur_s, duration_text=v.get("duration_text"),
+            duration_source=v.get("duration_source"),
+            elapsed_s=int(age) if age is not None else None,
+            age_h=round(age / 3600, 1) if age is not None else None,
+            cost=v.get("paid") or {}, currency=v.get("currency"),
+            price=v.get("price_panel"),
+            estimated=bool(v.get("started_estimated") or v.get("duration_estimated")),
+            expired=bool(age is not None and age > max_h),
+        )
+        if dur_s and age is not None:
+            item["remaining_s"] = max(0, int(dur_s - age))
+            item["progress"] = round(min(1.0, max(0.0, age / dur_s)), 3)
+        else:
+            item["remaining_s"] = None
+            item["progress"] = None       # 时长未知 → 页面不画百分比，只显示已过时间
+        return item
+
+    def _duration_from_confirm_jpg(self, type_name, ts):
+        """老记录补时长：找这笔升级当时存的确认页截图，把「升级时间」读出来。
+
+        为什么不用「上一轮巡检时间」估：那一轮里其实就存了确认页截图（logs/up_*_confirm_*.jpg），
+        上面的时长是真的，读它比估准。找不到截图就返回 None —— 页面显示「时长未知」。
+        """
+        import glob
+        if not type_name or not ts:
+            return None
+        stem = str(type_name).replace(" ", "_")
+        pats = [os.path.join(LOGD, "*_confirm_%s.jpg" % stem),
+                os.path.join(LOGD, "*_confirm_%s_*.jpg" % stem)]
+        best = None
+        for p in [x for pat in pats for x in glob.glob(pat)]:
+            m = re.search(r"(\d{8})-(\d{6})", os.path.basename(p))
+            if not m:
+                continue
+            try:
+                ft = int(datetime.datetime.strptime(m.group(1) + m.group(2),
+                                                    "%Y%m%d%H%M%S").timestamp())
+            except ValueError:
+                continue
+            d = abs(ft - int(ts))
+            if d <= JPG_MATCH_S and (best is None or d < best[0]):
+                best = (d, p)
+        if not best:
+            return None
+        try:
+            im = cv2.imread(best[1])
+            d = panel.read_duration(im) if im is not None else {}
+        except Exception as e:
+            self.log(f"  [builders] 回填时长读图失败 {best[1]}: {e}")
+            return None
+        if not d.get("seconds"):
+            return None
+        return dict(seconds=d["seconds"], text=d.get("text"), jpg=os.path.basename(best[1]))
+
+    def backfill_upgrades(self, up=None):
+        """给老记录补齐「开始时间 / 总时长」。写回状态，只做一次。
+
+        开始时间：`ts`（真升级那一刻写的）优先；真没有才用最近一轮巡检时间近似，并标 estimated。
+        总时长：这条升级真跑过确认页的话，logs 里那张确认页截图上有真值，读出来。
+                读不到就留 None，页面显示「时长未知（下一笔起精确）」——不编。
+        """
+        up = self.ast.get("mem_upgrades") or {} if up is None else up
+        if not up:
+            return 0
+        last_round = parse_iso_ts((self.ast.get("last_round") or {}).get("ts"))
+        n = 0
+        for k, v in up.items():
+            changed = False
+            if not v.get("started_ts"):
+                ts = v.get("ts") or last_round or int(time.time())
+                v["started_ts"] = int(ts)
+                v["started_at"] = iso_of(ts)
+                v["started_estimated"] = not v.get("ts")   # 用巡检时间凑的才算近似
+                changed = True
+            if not v.get("target_level"):
+                try:
+                    v["target_level"] = int(k.split("|")[1]) + 1
+                except (IndexError, ValueError):
+                    m = re.search(r"\((\d+)\s*[→\-]>?\s*(\d+)\)", str(v.get("name") or ""))
+                    if m:
+                        v["target_level"] = int(m.group(2))
+                changed = True
+            if not v.get("currency") and v.get("paid"):
+                v["currency"] = next(iter(v["paid"]))
+                changed = True
+            if not v.get("duration_s"):
+                got = self._duration_from_confirm_jpg(v.get("type") or k.split("|")[0],
+                                                      v.get("started_ts"))
+                if got:
+                    v.update(duration_s=got["seconds"], duration_text=got.get("text"),
+                             duration_source="confirm_jpg", duration_estimated=False,
+                             backfill_jpg=got.get("jpg"))
+                    changed = True
+                    self.log(f"  [builders] {v.get('name') or k} 补到时长 "
+                             f"{got.get('text')}（{got.get('seconds')}s，来自 {got.get('jpg')}）")
+            if changed:
+                n += 1
+        r = self.ast.get("mem_research") or {}
+        if r and not r.get("duration_s"):
+            # 老研究记录只有 hours（确认页「升级时间」当时只读到了天/小时）
+            try:
+                hrs = float(r.get("hours") or 0)
+            except (TypeError, ValueError):
+                hrs = 0
+            if hrs:
+                r["duration_s"] = int(round(hrs * 3600))
+                r["duration_source"] = "hours"
+                r["duration_estimated"] = False
+                if not r.get("started_ts"):
+                    r["started_ts"] = int(float(r.get("ts") or time.time()))
+                    r["started_at"] = iso_of(r["started_ts"])
+                self.ast["mem_research"] = r
+                n += 1
+        if n:
+            self.ast["mem_upgrades"] = up
+            jsave(STATE, self.ast)
+        return n
+
     def builders_state(self, prune=True):
         """数一下还有几个工人在施工 —— 硬目标「工人不闲着」靠这个判断。
 
@@ -172,11 +334,16 @@ class MemAuto:
           build_max_h（默认 168h）超过这么久还没涨级 = 当作状态失效，不计入忙碌
           （用户手动取消了施工、或这一笔其实没扣钱时会出现）
         找不到实例（被拆了/坐标变了）→ 也算释放。
+
+        状态迁移分两种，都写进 builds_done（页面上的历史明细读它）：
+          done     等级真的涨了 → kind=done，记完成时间 + 实际耗时
+          expired  超过 build_max_h 没动静 → kind=expired（「状态失效」，不是「已完成」）
         """
         total = int(self.opt("builders", 5) or 5)
+        self.backfill_upgrades()
         up = self.ast.get("mem_upgrades") or {}
         if not up:
-            return dict(total=total, busy=0, idle=total, pending=[], done=0)
+            return dict(total=total, busy=0, idle=total, pending=[], in_progress=[], done=0)
         try:
             rows = self.bld.snapshot()
         except Exception as e:
@@ -192,26 +359,38 @@ class MemAuto:
                 lv = int(float(lv))
                 x, y = [float(s) for s in pos.split(",")]
             except Exception:
-                done.append(k)
+                done.append((k, v, "expired", None))
                 continue
             now_lv = cur.get((nm, x, y)) if rows else None
-            age = tnow - float(v.get("ts", 0) or 0)
+            age = tnow - float(v.get("started_ts") or v.get("ts") or 0)
             if rows and now_lv is not None and now_lv > lv:
-                done.append(k)                      # 等级涨了 = 施工完成，工人已释放
+                done.append((k, v, "done", now_lv))      # 等级涨了 = 施工完成，工人已释放
             elif age > max_h:
-                done.append(k)                      # 太久没动静：状态失效
+                done.append((k, v, "expired", now_lv))   # 太久没动静：状态失效
             else:
                 busy += 1
-                pending.append(dict(key=k, name=v.get("name"), level=lv,
-                                    now_level=now_lv, age_h=round(age / 3600, 1)))
+                pending.append(self._upgrade_view(k, v, now_lv, tnow, max_h))
         if prune and done:
-            for k in done:
+            hist = self.ast.get("builds_done") or []
+            for k, v, kind, now_lv in done:
                 up.pop(k, None)
+                view = self._upgrade_view(k, v, now_lv, tnow, max_h)
+                hist.append(dict(
+                    key=k, kind=kind, at=iso_now(), ts=int(tnow),
+                    name=view.get("name"), type=view.get("type"),
+                    from_level=view.get("from_level"), to_level=view.get("to_level"),
+                    now_level=now_lv,
+                    started_ts=view.get("started_ts"), started_at=view.get("started_at"),
+                    duration_s=view.get("duration_s"), duration_text=view.get("duration_text"),
+                    actual_s=view.get("elapsed_s"),
+                    cost=view.get("cost"), currency=view.get("currency"),
+                    estimated=view.get("estimated")))
             self.ast["mem_upgrades"] = up
-            self.ast["builds_done"] = (self.ast.get("builds_done") or [])[-40:] + [
-                dict(key=k, at=iso_now()) for k in done]
+            self.ast["builds_done"] = hist[-60:]
         idle = max(0, total - busy)
-        return dict(total=total, busy=busy, idle=idle, pending=pending, done=len(done))
+        return dict(total=total, busy=busy, idle=idle, pending=pending,
+                    in_progress=pending, done=len(done),
+                    expired=len([d for d in done if d[2] == "expired"]))
 
     # ---------------- 目标 ----------------
     def mem_targets(self, res=None, T=None):
@@ -390,6 +569,9 @@ class MemAuto:
             p2 = self._shot_panel("confirm_%s" % t["_type"])
             im2 = cv2.imread(p2) if p2 else None
             cf = panel.confirm_page(im2) if im2 is not None else {"open": False}
+            # 确认页右下角就写着这栋升完要多久（「升级时间 2天1小时53分钟」）：
+            # 这一笔的进度条全靠它，读不到就记 None（页面显示「时长未知」，不拿别的数凑）
+            drec = panel.read_duration(im2) if (cf.get("open") and im2 is not None) else {}
             if not cf.get("open") or not cf.get("btn"):
                 mem.shell().tap(*cf.get("close", (1926, 76)), wait=0.8)
                 mem.shell().tap(*dis, wait=0.6)
@@ -408,7 +590,9 @@ class MemAuto:
                        paid=paid, before=dict(before), after=dict(after),
                        currency_panel=cur, cost_cfg=price_cfg, caps=caps,
                        price_note=price_note, panel_jpg=p, confirm_jpg=p2,
-                       after_jpg=p3, btn=panel_btn, confirm=cf["btn"])
+                       after_jpg=p3, btn=panel_btn, confirm=cf["btn"],
+                       from_level=t["_level"], target_level=t["_level"] + 1,
+                       duration_s=drec.get("seconds"), duration_text=drec.get("text"))
             if not paid:
                 mem.shell().tap(*dis, wait=0.6)
                 self._note_fail(t, "no_charge")
@@ -424,10 +608,20 @@ class MemAuto:
                 rec["alert"] = "wrong_currency_paid: %s" % paid
             if table_cur != cur:
                 rec["table_currency"] = table_cur
+            # 扣费核对通过 = 这一笔真的开工了：开始时间 + 面板读到的总时长一起落盘，
+            # 页面上的进度条和倒计时就靠这两个数（游戏关着也能算，纯时间推算）
+            started = int(time.time())
             self.ast.setdefault("mem_upgrades", {})[t["_key"]] = dict(
-                ts=int(time.time()),
+                ts=started, started_ts=started, started_at=iso_of(started),
+                started_estimated=False,
                 cd=float(self.opt("mem_cooldown_h", 24) or 24) * 3600,
-                name=t["name"], paid=paid, price_panel=price, currency=cur)
+                name=t["name"], type=t["_type"], key=t["_key"],
+                from_level=t["_level"], target_level=t["_level"] + 1,
+                paid=paid, cost_paid=sum(paid.values()) if paid else None,
+                price_panel=price, currency=cur,
+                duration_s=drec.get("seconds"), duration_text=drec.get("text"),
+                duration_source=("confirm_panel" if drec.get("seconds") else None),
+                duration_estimated=False)
             # 实测扣费就是真价 → 回填价格表（源=upgrade_delta）
             # 但「面板价和表里的价不一致」时不写表：那说明点开的可能是同等级的另一栋
             # （实测点加农炮会点到同格的隐形炸弹），写进去就把表污染了
@@ -660,7 +854,11 @@ class MemAuto:
             rec["builders"] = dict(
                 total=bs.get("total"), busy=bs.get("busy"), idle=bs.get("idle"),
                 skip=bs.get("why_skip"), freed=bs.get("done"),
-                pending=[p.get("name") for p in (bs.get("pending") or [])])
+                expired=bs.get("expired"),
+                pending=[p.get("name") for p in (bs.get("pending") or [])],
+                # 在建明细（开始时间 / 总时长 / 剩余 / 进度）—— 看板「正在升级」读它，
+                # 同时也是每轮的历史快照，事后能对着 history/<id>/meta.json 复盘
+                in_progress=bs.get("in_progress") or [])
             rec["n_candidates"] = self.n_cand_all
             rec["n_plan"] = self.n_plan
             shown = tg[:5] if tg else (self.cand_head or [])
@@ -792,12 +990,20 @@ def main():
     ap.add_argument("--include-bb", dest="include_bb", action="store_true", default=None)
     ap.add_argument("--no-walls", dest="include_walls", action="store_false", default=None)
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--backfill", action="store_true",
+                    help="只给在建记录补「开始时间 / 总时长」，不开游戏、不点任何东西")
     a = ap.parse_args()
     cfg = cfg_of(max_targets=a.max_targets, max_cost=a.max_cost, currency=a.currency,
                  builders=a.builders, include_bb=a.include_bb,
                  include_walls=a.include_walls)
     auto = MemAuto(cfg, a, quiet=a.quiet)
     try:
+        if a.backfill:
+            n = auto.backfill_upgrades()
+            print(json.dumps(dict(filled=n,
+                                  mem_upgrades=auto.ast.get("mem_upgrades") or {}),
+                             ensure_ascii=False, indent=1, default=float))
+            return 0
         if a.plan:
             res = auto.read()
             img = mem.grab()

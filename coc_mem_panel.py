@@ -470,6 +470,39 @@ def _price_block(im, cs, tpl, hx, py0, py1, mask_fn):
     return r
 
 
+# ---------------------------------------------------------------- 确认页 / 时长
+# 确认页右下角「升级时间 / 1天12小时」那一块（19.100.1 实测：标签 y≈900、值 y≈950）
+DUR_REGIONS = ((1500, 880, 1990, 1000), (1440, 850, 2060, 1030))
+
+
+def read_duration(im, regions=None):
+    """确认页上的「升级时间 2天1小时53分钟」→ {text, seconds, region}
+
+    只读那一小块、只认「能整串解析成时长」的框：OCR 会把旁边按钮上的价格数字
+    （「1 800 000」）也吐出来，那些解析不出单位，就被 parse_duration 挡掉了。
+    解析不出来就返回 seconds=None，不猜（页面上宁可显示「时长未知」）。
+    """
+    import coc_duration
+    out = dict(text=None, seconds=None, region=None, tried=[])
+    if im is None:
+        return out
+    import coc_patrol2
+    for region in (regions or DUR_REGIONS):
+        x0, y0, x1, y1 = region
+        x1, y1 = min(x1, im.shape[1]), min(y1, im.shape[0])
+        try:
+            boxes = coc_patrol2.ocr_all(im, (x0, y0, x1, y1))
+        except Exception:
+            boxes = []
+        out["tried"].append([t.get("t") for t in boxes])
+        for b in boxes:
+            sec = coc_duration.parse_duration(b.get("t"))
+            if sec:
+                out.update(text=b["t"], seconds=sec, region=list(region))
+                return out
+    return out
+
+
 # ---------------------------------------------------------------- 确认页
 def confirm_page(im):
     """识别「升级确认页」→ {open, btn (x,y) or None, btn_box, close (x,y)}
@@ -508,6 +541,7 @@ if __name__ == "__main__":
         if im is None:
             print(p, "读不出来")
             continue
+        print(p, "duration:", read_duration(im))
         r = read(im)
         r.pop("cards", None)
         print(p, r)
