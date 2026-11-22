@@ -391,9 +391,16 @@ def popup_x(im):
     best = None
     for k in range(1, n):
         x, y, w, hh, area = stats[k]
-        if area >= 1500 and 40 <= w <= 110 and 40 <= hh <= 110:
-            if best is None or area > best[0]:
-                best = (int(area), int(x + 1650 + w // 2), int(y + 15 + hh // 2))
+        if not (area >= 1500 and 40 <= w <= 110 and 40 <= hh <= 110):
+            continue
+        # 红块中间必须有个白色的「✕」：否则会把底栏红角标、资源条红点这类纯色块也当成关闭键
+        box = sub[y:y + hh, x:x + w]
+        white = int(((box[:, :, 0] > 195) & (box[:, :, 1] > 195)
+                     & (box[:, :, 2] > 195)).sum())
+        if white < max(60, area * 0.04):
+            continue
+        if best is None or area > best[0]:
+            best = (int(area), int(x + 1650 + w // 2), int(y + 15 + hh // 2))
     return (best[1], best[2]) if best else None
 
 
