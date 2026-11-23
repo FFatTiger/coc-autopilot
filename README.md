@@ -84,6 +84,9 @@
 ├── tap_offsets.json    # 建筑类型 → 点击偏移（投影点落在建筑顶棱，往下挪才点得到本体）
 ├── coc_patrol_run.py   # 一轮巡检的编排 + 落盘 + 历史清理（生产入口，按 config.backend 选后端）
 ├── coc_dashboard.py    # 看板：页面、API、手动触发、配置读写
+├── coc_names.py        # 英文类型名 → 中文（建筑 76 / 兵种 55 / 法术 18），看板只显示中文
+├── static/icons/       # 图标（base64 内嵌进页面，零外部请求）：资源 4 张 + 建筑/兵种/法术 102 张
+├── tools/icons_fetch.py# 从社区 wiki 抓建筑/兵种/法术立绘 → static/icons/*.png（80×80、透明、≤6KB）
 ├── coc_config.py       # 配置结构与校验，按北京时间判断是否到点
 ├── mt.py               # minitouch 封装：坐标换算、tap/press/pinch、断线重连
 ├── mc.py               # minicap 封装：常驻帧流，失败降级 screencap
@@ -465,9 +468,27 @@ python3 coc_progress.py --json    # 接口那一份
 python3 coc_mem_auto.py --backfill  # 只补老记录的开始时间/时长，不开游戏不点东西
 ```
 
-图标：`static/icons/*.png` 由 `tools/icons_build.py` 从游戏截图里裁（资源图标 + 锤子），
-以 base64 内嵌进页面（零外部请求）；建筑类型图标还没裁到，页面上用「按类型着色的圆角块 +
-首字母」占位。
+**名字和图标**：页面上不留英文，`coc_names.py` 把类型名、兵种名、状态词换成中文
+（`Cannon` → 加农炮、`Dark Elixir Drill` → 暗黑重油钻井、`timeout` → 超时），
+`/api/state`、`/api/runs` 的展示字段在服务端就换好，另外补 `type_en` / `icon` 两个字段给图标用。
+认不出的新类型显示「未知建筑」而不是英文原文，`python3 coc_names.py --check` 能列出没映射的。
+
+图标在 `static/icons/*.png`，以 base64 内嵌进页面（零外部请求、不走 CDN）：
+
+- 资源图标（金 / 圣水 / 暗黑 / 宝石）：`tools/icons_build.py` 从游戏截图裁
+- 建筑 / 兵种 / 法术：`tools/icons_fetch.py` 从社区 wiki 拉每个建筑的官方立绘
+  （挑最高等级那张），裁边、补正方形、缩到 80×80、透明底、单张 ≤6KB
+
+APK 里没有按名字命名的建筑 PNG（美术是 `scattachment` 打的 3D 资源），所以没走解包。
+新类型要图标就加一行 `PREFIX` 再跑一次：
+
+```bash
+python3 tools/icons_fetch.py                      # 全量（约 5 分钟，按名字查 wiki）
+python3 tools/icons_fetch.py --only Cannon Monolith
+python3 tools/icons_fetch.py --resources          # 只补四个资源图标
+```
+
+取不到图标的类型不用管：页面按类型名取色画一枚塔楼剪影兜底，不摆首字母。
 
 ## 工作原理
 

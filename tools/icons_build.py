@@ -8,6 +8,9 @@
 底都是纯色/单色背景，按饱和度 / 亮度把背景抠掉，留 alpha。裁不到的不硬编，跳过即可——
 页面那边有兜底（按类型着色的圆角块 + 首字母）。
 
+注意：金币/圣水/暗黑/宝石四个资源图标现在由 tools/icons_fetch.py 从社区 wiki 取（和建筑图标
+同一套画风）。本脚本留作「断网时从截图自制」的退路，跑它会覆盖掉 wiki 版本。
+
 用法：
   python3 tools/icons_build.py                 # 用默认源图（logs/ + history/ 里的真截图）
   python3 tools/icons_build.py --check         # 只打印裁到的图标尺寸，不写文件
