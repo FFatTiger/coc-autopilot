@@ -444,7 +444,7 @@ def run_memory(cfg, run_dir, meta):
                  ("before", "after", "final", "gain", "delta", "collected", "bubbles",
                   "builders", "n_candidates", "n_plan", "research", "spent",
                   "candidates", "calib", "brightness", "ensure", "notes", "n_ok",
-                  "cold_start", "dur_s")
+                  "cold_start", "fail_screen", "dur_s")
                  if rec.get(k) is not None})
     # 看板的「可升级项」读的是 items（OCR 后端填的是建筑列表行），内存后端这里换成
     # 内存枚举出来的候选：名字里带「当前级→下一级」，价格没有就留 None（看板显示 —）。

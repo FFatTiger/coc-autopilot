@@ -221,5 +221,17 @@
 "title_level": 6,
 "tap_dx": 0,
 "tap_dy": 45
+},
+"Dark Elixir Drill|3": {
+"currency": "elixir",
+"cost": 900000,
+"source": "upgrade_delta",
+"at": "2026-11-23 21:07:34"
+},
+"Dark Elixir Drill|6": {
+"currency": "elixir",
+"cost": 2100000,
+"source": "upgrade_delta",
+"at": "2026-11-23 21:07:58"
 }
 }

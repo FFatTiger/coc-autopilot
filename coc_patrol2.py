@@ -28,6 +28,10 @@ def sh(cmd, timeout=25):
 
 _mc = None
 _mc_tried = False
+# 抓帧失败计数器：grab() 第一行就读它，但它以前只在「成功取回一帧」之后才被赋值，
+# 于是 minicap 起不来的机器上第一次 grab() 直接 NameError（OCR 后端 --dry 就是这样崩的）。
+# 必须在这里初始化。
+_mc_fail = 0
 
 
 def init_capture():
@@ -350,6 +354,349 @@ def classify(tx):
     if any(len(t.strip()) <= 4 and any(k in t for k in PANEL_BTN) for t in texts):
         return "panel"
     return "unknown"
+
+
+# ---------------- 弹窗 / 遮挡物的图形判据（两个后端共用） ----------------
+# 为什么不能只靠文字：弹窗文案几乎每版本都换（「欢迎来到公共频道」「城镇广场好礼派发中」
+# 「专属礼包」……），而且文字得等 OCR——冷启动那几十秒里一帧 OCR 就是 300~800ms。
+# 形状判据只看右上角那一小块：亮色实心圆角块 + 深色 ✕，两种弹窗都能认出来。
+#
+# 19.100.1 实测的两种关闭键，都在屏幕右上角、都离底栏按钮很远：
+#   红圆角块 + 白 ✕   研究/确认页、商店礼包：(1755,64)、(1847,85)、(1830,180)…
+#   白圆角块 + 深色 ✕ 「欢迎来到公共频道」这类活动页：(1932,119)，62×63px
+# 所以「关弹窗只点右上角」这条是安全的：绝不点「前往查看」「领取」这类会跳界面/花资源的按钮。
+POPUP_X_CORNER = (2150, 60)     # 实在认不出关闭键时先试这里（右上角，村庄里是空白）
+DISMISS_TAPS = ((100, 700),      # 标定视角的空地（collectors_mem.json 的 dismiss）
+                (1900, 600),     # 右侧空地：左侧聊天面板打开时用这个（避开 HUD 和提示气泡）
+                (1700, 330))     # 再退一步：面板右上方
+
+
+def _gray(im):
+    return cv2.cvtColor(im, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+
+def _red_frac(im):
+    hsv = cv2.cvtColor(im, cv2.COLOR_BGR2HSV)
+    h, s, v = (hsv[:, :, i].astype(int) for i in range(3))
+    return float((((h <= 8) | (h >= 170)) & (s > 120) & (v > 120)).mean())
+
+
+def _cross_inside(box):
+    """浅色块里有没有深色 "✕/＋"：Otsu 分两层 + 四个象限都有笔画。
+
+    四象限是区分「✕/＋」和「一根竖条 / 一行字」的关键：竖条只占中间两列，
+    一条横线只占上下两行，四象限判据能把它们挡掉。
+    """
+    g = _gray(box)
+    h, w = g.shape
+    inner = g[int(h * 0.16):int(h * 0.84), int(w * 0.16):int(w * 0.84)].astype(np.uint8)
+    if inner.size < 100:
+        return None
+    th, _ = cv2.threshold(inner, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    dark = inner < th
+    frac = float(dark.mean())
+    if not (0.04 <= frac <= 0.45):
+        return None
+    if not dark.any() or dark.all():
+        return None
+    contrast = float(inner[~dark].mean() - inner[dark].mean())
+    if contrast < 45:                  # 两层差得够开才算真有笔画（不是噪声）
+        return None
+    hh, ww = inner.shape[0] // 2, inner.shape[1] // 2
+    quads = [int(dark[:hh, :ww].sum()), int(dark[:hh, ww:].sum()),
+             int(dark[hh:, :ww].sum()), int(dark[hh:, ww:].sum())]
+    if min(quads) < max(10, int(dark.sum() * 0.06)):
+        return None
+    return dict(frac=round(frac, 3), contrast=round(contrast, 1), quads=quads)
+
+
+def popup_x_red(im, region=None, min_area=1500):
+    """画面右上角那个红色圆角 X（弹窗/确认页的关闭键）→ dict(x, y, box) 或 None
+
+    这是「有没有模态弹窗」最干净的判据：实测干净村庄 / 实验室面板 / 战斗页都没有这个红斑，
+    而研究弹窗（1755,64）和研究确认页（1847,85）各有一个 60~70px 的红圆角方块。
+    比「顶部一大片浅色」靠谱——「正在升级中」那条绿色横幅会把浅色判据带瞎。
+
+    region 可以换成别处（屏幕中央的对话框，关闭键在对话框自己的右上角），
+    min_area 跟着缩小：对话框上的 ✕ 只有 50px 见方（实测面积 1396）。
+    """
+    if im is None or im.shape[0] < 300 or im.shape[1] < 1900:
+        return None
+    # y 放宽到 280：商店/礼包这类推广弹层的 X 比研究弹窗低一截（实测 (1830,180)）
+    rx0, ry0, rx1, ry1 = region or (1650, 15, 1960, 280)
+    rx0, ry0 = max(0, rx0), max(0, ry0)
+    rx1, ry1 = min(im.shape[1], rx1), min(im.shape[0], ry1)
+    sub = im[ry0:ry1, rx0:rx1]
+    hsv = cv2.cvtColor(sub, cv2.COLOR_BGR2HSV)
+    h = hsv[:, :, 0].astype(int)
+    sat = hsv[:, :, 1].astype(int)
+    v = hsv[:, :, 2].astype(int)
+    m = ((((h <= 8) | (h >= 170)) & (sat > 120) & (v > 120))).astype(np.uint8)
+    n, lab, stats, cent = cv2.connectedComponentsWithStats(m, 8)
+    best = None
+    for k in range(1, n):
+        x, y, w, hh, area = stats[k]
+        if not (area >= min_area and 40 <= w <= 110 and 40 <= hh <= 110):
+            continue
+        # 红块中间必须有个白色的「✕」：否则会把底栏红角标、资源条红点这类纯色块也当成关闭键
+        box = sub[y:y + hh, x:x + w]
+        white = int(((box[:, :, 0] > 195) & (box[:, :, 1] > 195)
+                     & (box[:, :, 2] > 195)).sum())
+        if white < max(60, area * 0.04):
+            continue
+        if best is None or area > best[0]:
+            best = (int(area), int(x + rx0 + w // 2), int(y + ry0 + hh // 2))
+    return dict(kind="red-x", x=best[1], y=best[2], box=None, score=best[0]) if best else None
+
+
+def centered_dialog(im):
+    """屏幕中央的大浅色卡片（「恭喜获得 宝箱×3」这类对话框）→ dict 或 None
+
+    卡片的关闭键不在屏幕右上角，而在卡片自己的标题栏右上角（实测 (1480,299)，
+    53×49px 的红块 + 白 ✕）。所以先认出卡片，再在「标题栏那一条」里找红 ✕；
+    找不到就退回卡片的右上角（那里的 ✕ 一般就跑不掉，点了也只会点在边框上）。
+
+    在 195 张真实画面上只命中 1 张（真的就是那张「恭喜获得」），其它全是 None：
+    要求卡片占屏 6% 以上、填充率 ≥0.85、宽高比 1.0~2.4，村庄/面板/推广页都过不了。
+    """
+    if im is None or im.shape[0] < 300:
+        return None
+    H, W = im.shape[:2]
+    y0, y1, x0, x1 = int(H * 0.04), int(H * 0.96), int(W * 0.10), int(W * 0.90)
+    sub = im[y0:y1, x0:x1]
+    hsv = cv2.cvtColor(sub, cv2.COLOR_BGR2HSV)
+    s = hsv[:, :, 1].astype(int)
+    v = hsv[:, :, 2].astype(int)
+    m = ((s < 70) & (v > 165)).astype(np.uint8)
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+    n, lab, stats, cent = cv2.connectedComponentsWithStats(m, 8)
+    best = None
+    for k in range(1, n):
+        x, y, w, h, area = stats[k]
+        frac = area / float(W * H)
+        if not (0.06 <= frac <= 0.45):
+            continue
+        if abs(area / float(w * h) - 1.0) > 0.15:      # 实心卡片
+            continue
+        if not (1.0 <= w / float(max(1, h)) <= 2.4):
+            continue
+        if best is None or area > best[0]:
+            best = (area, (int(x + x0), int(y + y0), int(w), int(h)))
+    if not best:
+        return None
+    bx, by, bw, bh = best[1]
+    # 标题栏那一条：卡片上沿往上一截（✕ 压在标题栏里，可能整个在卡片外面）
+    band = (bx - 12, by - int(bh * 0.22), bx + bw + 12, by + int(bh * 0.18))
+    rx = popup_x_red(im, region=band, min_area=900)
+    px, py = (rx["x"], rx["y"]) if rx else (bx + bw - int(bw * 0.055), by - int(bh * 0.06))
+    return dict(kind="dialog", box=[bx, by, bw, bh], x=int(px), y=int(py),
+                how="red-x" if rx else "corner")
+
+
+def popup_x_light(im):
+    """右上角的「白色/浅色圆角方块 + 深色 ✕」→ dict(x, y, box) 或 None
+
+    「欢迎来到公共频道」这种活动页用的是浅色方块（实测 (1901,88) 起、62×63px、
+    米白底 + 深棕 ✕），红 ✕ 判据认不出来，冷启动就会卡满 120s。
+
+    判据全部是形状特征，不绑死坐标：右上 30% 屏内找
+      ① 实心浅色块（亮度高、饱和低，闭运算补掉 ✕ 挖的洞）
+      ② 接近正方形、边长 28~78px
+      ③ 本身够亮（灰均值 ≥195）且被更暗的背景包着（≥60 的落差，弹窗压暗遮罩的特征）
+      ④ 块中央是深色十字/斜叉（四象限都有笔画）
+    ①②③④ 缺一不可：少 ③ 会把 HUD 里的「垃圾桶」图标认成关闭键，少 ④ 会把资源数字认进去。
+    在 195 张真实画面（村庄 / 建筑面板 / 研究弹窗）上跑过，误报 0。
+    """
+    if im is None or im.shape[0] < 300 or im.shape[1] < 1900:
+        return None
+    H, W = im.shape[:2]
+    x0 = int(W * 0.70)
+    sub = im[0:int(H * 0.32), x0:W]
+    hsv = cv2.cvtColor(sub, cv2.COLOR_BGR2HSV)
+    s = hsv[:, :, 1].astype(int)
+    v = hsv[:, :, 2].astype(int)
+    m = ((s < 70) & (v > 150)).astype(np.uint8)
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    n, lab, stats, cent = cv2.connectedComponentsWithStats(m, 8)
+    best = None
+    for k in range(1, n):
+        x, y, w, h, area = stats[k]
+        if not (28 <= w <= 78 and 28 <= h <= 78):
+            continue
+        if abs(w - h) > 0.30 * max(w, h):
+            continue
+        fill = area / float(w * h)
+        if not (0.65 <= fill <= 0.99):          # 实心（圆角会削掉一点）
+            continue
+        box = sub[y:y + h, x:x + w]
+        bmean = float(_gray(box).mean())
+        if bmean < 195:                          # 关闭键是亮白块；HUD 图标/数字笔画没这么亮
+            continue
+        if _red_frac(box) > 0.12:                # 红底白 ✕ 归 popup_x_red 管
+            continue
+        ry0, ry1 = max(0, y - 14), min(sub.shape[0], y + h + 14)
+        rx0, rx1 = max(0, x - 14), min(sub.shape[1], x + w + 14)
+        rmean = float(_gray(sub[ry0:ry1, rx0:rx1]).mean())
+        if bmean - rmean < 60:                   # 亮块要压在暗背景上（弹窗的压暗遮罩）
+            continue
+        cr = _cross_inside(box)
+        if not cr:
+            continue
+        score = area + cr["contrast"]
+        if best is None or score > best[0]:
+            best = (score, dict(kind="white-x", x=int(x0 + x + w // 2), y=int(y + h // 2),
+                                box=[int(x0 + x), int(y), int(w), int(h)], **cr))
+    return best[1] if best else None
+
+
+def modal_shade(im):
+    """整屏被压暗 + 中间还有一块亮的 = 有模态弹窗盖在村庄上 → dict 或 None
+
+    兜底判据：认不出关闭键时用。两件事必须同时成立，否则夜晚的村庄（本来就暗）
+    会被当成弹窗，白点一下还可能开出仓储面板。
+    """
+    if im is None or im.shape[0] < 300:
+        return None
+    H, W = im.shape[:2]
+    g = _gray(im)
+    dark_frac = float((g < 85).mean())
+    c = g[int(H * 0.20):int(H * 0.80), int(W * 0.30):int(W * 0.70)]
+    center = float(c.mean())
+    center_dark = float((c < 85).mean())
+    if not (dark_frac > 0.45 and center > 110 and center_dark < 0.20):
+        return None
+    return dict(dark_frac=round(dark_frac, 3), center=round(center, 1),
+                center_dark=round(center_dark, 3))
+
+
+def left_sidebar(im):
+    """左侧竖长面板（部落信息/聊天栏）开着？→ dict(x, run) 或 None
+
+    判据是「一条竖直硬边贯穿大半屏」：面板右沿是一根几像素宽、从上贯到下的直边，
+    村庄里的城墙/建筑只可能是短线段。实测 2220x1080 上（0.24~0.58 屏宽内）
+    面板给出 700/993 的连续段，干净村庄最多 89/993，差一个数量级。
+    """
+    if im is None or im.shape[0] < 300:
+        return None
+    H, W = im.shape[:2]
+    gx = np.abs(cv2.Sobel(_gray(im), cv2.CV_32F, 1, 0, ksize=3))
+    rx0, rx1 = int(W * 0.24), int(W * 0.58)
+    sub = gx[int(H * 0.04):int(H * 0.96), rx0:rx1] > 60
+    best = (0, 0)
+    for cx in range(sub.shape[1]):
+        col = sub[:, cx]
+        run = mx = 0
+        for on in col:
+            run = run + 1 if on else 0
+            if run > mx:
+                mx = run
+        if mx > best[1]:
+            best = (rx0 + cx, mx)
+    if best[1] < 0.55 * sub.shape[0]:
+        return None
+    return dict(x=int(best[0]), run=int(best[1]), span=int(sub.shape[0]))
+
+
+def hint_bubble(im):
+    """中下偏右的白色对话气泡（新手提示/人物台词框）→ dict(x, y, box) 或 None
+
+    19.100.1 实测：关掉「欢迎来到公共频道」之后，弓箭手女王会跳出来讲一句
+    「现在可以直接在部落聊天中查看部落对战进度！」——一块 550×190 的白色圆角气泡。
+    它不挡按钮，但会压住采集点，所以先认出来（只认不点：点气泡会打开聊天）。
+    """
+    if im is None or im.shape[0] < 300:
+        return None
+    H, W = im.shape[:2]
+    x0, y0 = int(W * 0.40), int(H * 0.55)
+    sub = im[y0:int(H * 0.88), x0:int(W * 0.80)]
+    hsv = cv2.cvtColor(sub, cv2.COLOR_BGR2HSV)
+    s = hsv[:, :, 1].astype(int)
+    v = hsv[:, :, 2].astype(int)
+    m = ((s < 60) & (v > 165)).astype(np.uint8)
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+    n, lab, stats, cent = cv2.connectedComponentsWithStats(m, 8)
+    best = None
+    for k in range(1, n):
+        x, y, w, h, area = stats[k]
+        if area < 12000 or w < 140 or h < 60:
+            continue
+        if not (1.2 <= w / float(max(1, h)) <= 4.0):
+            continue
+        # 0.40：气泡的白色会和旁边的白字/HUD 沾在一起，bbox 被撑大，填充率掉到 0.46。
+        # 在 195 张真实画面上试过 0.40 只多认回两张真的气泡（误报仍为 0）。
+        if area < 0.40 * w * h:
+            continue
+        g = _gray(sub[y:y + h, x:x + w])
+        if not (0.02 <= float((g < 120).mean()) <= 0.35):   # 气泡里有深色字
+            continue
+        if best is None or area > best[0]:
+            best = (area, dict(kind="bubble", x=int(x0 + x + w // 2), y=int(y0 + y + h // 2),
+                               box=[int(x0 + x), int(y0 + y), int(w), int(h)]))
+    return best[1] if best else None
+
+
+def close_candidates(im=None):
+    """关弹窗时按顺序试的点：认出来的 ✕ 优先，最后才是固定角点。
+
+    返回 [(x, y, why), …]。只会落在这几个地方：卡片/弹窗自己的 ✕、右上角的 ✕、
+    右上角空白 (2150,60)。绝不会碰到「前往查看」「领取」这类按钮
+    （它们在弹窗底部中间，和这里每一个候选点都隔着半屏）。
+    """
+    pts = []
+    for fn, why in ((centered_dialog, "dialog-x"), (popup_x_red, "red-x"),
+                    (popup_x_light, "white-x")):
+        c = fn(im) if im is not None else None
+        if c:
+            pts.append((c["x"], c["y"], why))
+    pts.append((AD_CLOSE[0], AD_CLOSE[1], "ad-x"))
+    pts.append((POPUP_X_CORNER[0], POPUP_X_CORNER[1], "corner"))
+    out = []
+    for p in pts:                       # 挨得太近的点合并，别对着同一块地方点两遍
+        if all(abs(p[0] - q[0]) > 40 or abs(p[1] - q[1]) > 40 for q in out):
+            out.append(p)
+    return out
+
+
+def blocker(img, ignore=()):
+    """画面上挡着村庄的是什么东西 → dict(kind, x, y, action, …) 或 None
+
+    kind ∈ white-x / red-x / dialog / shade / sidebar / bubble
+    action: tap（点 x,y）
+    ignore：这次不想管的类型（比如提示气泡已经点过一次了，就别一直报它）
+
+    优先级：能认出 ✕ 就点 ✕；其次看左侧面板；再看「整屏压暗」兜底；气泡只认不点。
+    这个函数不点击、不 OCR：冷启动每 2s 判一次，形状判据一帧只要 20~40ms。
+    """
+    if img is None:
+        return None
+    x = popup_x_light(img)
+    if x:
+        return dict(kind="white-x", x=x["x"], y=x["y"], action="tap", box=x.get("box"))
+    x = popup_x_red(img)
+    if x:
+        return dict(kind="red-x", x=x["x"], y=x["y"], action="tap", box=x.get("box"))
+    cd = centered_dialog(img)
+    if cd:
+        return dict(kind="dialog", x=cd["x"], y=cd["y"], action="tap",
+                    box=cd.get("box"), how=cd.get("how"))
+    sb = left_sidebar(img)
+    if sb:
+        # 面板开着时，标定空地 (100,700) 落在面板上（点了等于没点）。
+        # 所以取第一个在面板右沿之外的空地候选。
+        pt = next(((px, py) for px, py in DISMISS_TAPS if px > sb["x"] + 40),
+                  DISMISS_TAPS[1])
+        return dict(kind="sidebar", x=pt[0], y=pt[1], action="tap",
+                    edge=sb["x"], run=sb["run"])
+    sh = modal_shade(img)
+    if sh:
+        cx, cy, why = close_candidates(img)[0]
+        return dict(kind="shade", x=cx, y=cy, action="tap", why=why, **sh)
+    if "bubble" not in ignore:
+        bub = hint_bubble(img)
+        if bub:
+            return dict(kind="bubble", x=DISMISS_TAPS[0][0], y=DISMISS_TAPS[0][1],
+                        action="tap", box=bub.get("box"))
+    return None
 
 
 def find_btn(tx, keys):

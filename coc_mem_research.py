@@ -374,34 +374,12 @@ def top_title(im):
 def popup_x(im):
     """画面右上角那个红色圆角 X（弹窗/确认页的关闭键）→ (x, y) 或 None
 
-    这是「有没有模态弹窗」最干净的判据：实测干净村庄 / 实验室面板 / 战斗页都没有这个红斑，
-    而研究弹窗（1755,64）和研究确认页（1847,85）各有一个 60~70px 的红圆角方块。
-    比「顶部一大片浅色」靠谱——「正在升级中」那条绿色横幅会把浅色判据带瞎。
+    判据本体在 coc_patrol2.popup_x_red：它和「白 ✕」判据（popup_x_light）放在一起，
+    两个后端共用同一份。这里保留原来的函数名/返回形状（元组），调用方一行都不用改。
     """
-    if im is None or im.shape[0] < 300 or im.shape[1] < 1900:
-        return None
-    # y 放宽到 280：商店/礼包这类推广弹层的 X 比研究弹窗低一截（实测 (1830,180)）
-    sub = im[15:280, 1650:1960]
-    hsv = cv2.cvtColor(sub, cv2.COLOR_BGR2HSV)
-    h = hsv[:, :, 0].astype(int)
-    sat = hsv[:, :, 1].astype(int)
-    v = hsv[:, :, 2].astype(int)
-    m = ((((h <= 8) | (h >= 170)) & (sat > 120) & (v > 120))).astype(np.uint8)
-    n, lab, stats, cent = cv2.connectedComponentsWithStats(m, 8)
-    best = None
-    for k in range(1, n):
-        x, y, w, hh, area = stats[k]
-        if not (area >= 1500 and 40 <= w <= 110 and 40 <= hh <= 110):
-            continue
-        # 红块中间必须有个白色的「✕」：否则会把底栏红角标、资源条红点这类纯色块也当成关闭键
-        box = sub[y:y + hh, x:x + w]
-        white = int(((box[:, :, 0] > 195) & (box[:, :, 1] > 195)
-                     & (box[:, :, 2] > 195)).sum())
-        if white < max(60, area * 0.04):
-            continue
-        if best is None or area > best[0]:
-            best = (int(area), int(x + 1650 + w // 2), int(y + 15 + hh // 2))
-    return (best[1], best[2]) if best else None
+    import coc_patrol2
+    c = coc_patrol2.popup_x_red(im)
+    return (c["x"], c["y"]) if c else None
 
 
 def is_popup(im):

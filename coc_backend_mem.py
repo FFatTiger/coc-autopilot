@@ -445,12 +445,35 @@ def login_page(joined):
     return "登录" in joined and ("QQ" in joined or "微信" in joined)
 
 
+def _village_ok(tx):
+    """比 coc_patrol2.classify 宽松一点的村庄判据（只给内存后端用，不动公共原语）。
+
+    classify 要求「y<100 处有一个 ≥5 位的数字」——但 OCR 会把 3 270 907 拆成
+    '3270' + '907'（实测 11-23 21:00 那轮就是这样），classify 于是判成 unknown，
+    冷启动眼睁睁等满 120s 判失败，而画面明明就是干净村庄（fail.jpg 为证）。
+    这里把右上角资源区那几段数字**按位置拼起来再数位数**，其余判据（底栏「建造/战斗」）
+    和 classify 完全一致。
+    """
+    if not tx:
+        return False
+    bottom = [t["t"] for t in tx if t["y"] > 940]
+    if not any("建造" in t or "战斗" in t for t in bottom):
+        return False
+    digits = 0
+    for t in tx:
+        if t["y"] < 100 and 1700 <= t["x"] <= 2220:
+            digits += len("".join(c for c in t["t"] if c.isdigit()))
+    return digits >= 5
+
+
 def village_probe(img=None):
     """画面里是什么。返回 (kind, joined_text)，kind ∈ village/loading/reconnect/login/
     ad/popup/quit_confirm/panel/unknown/noimg。
 
     判据直接用 coc_patrol2 的 classify（底栏「建造/战斗」+ 右上角 5 位数字 = 资源条），
     它已经在 OCR 后端跑了很久；这里只把它的结论翻译成「该等 / 该点 / 该放弃」。
+    唯一的补充：classify 说 unknown/panel、但底栏和资源数字都在时，按 _village_ok 认成村庄
+    （数字被 OCR 拆段的情况，见 _village_ok）。
     """
     if img is None:
         img = grab()
@@ -469,7 +492,10 @@ def village_probe(img=None):
         return "login", joined
     if mean < 45 and not any(len(t.get("t", "")) >= 2 for t in tx):
         return "loading", joined          # 全黑的载入页：不浪费 OCR/点击，接着等
-    return _ocr.classify(tx), joined
+    kind = _ocr.classify(tx)
+    if kind in ("unknown", "panel") and _village_ok(tx):
+        kind = "village"
+    return kind, joined
 
 
 def screen_kind(img=None):
@@ -491,21 +517,50 @@ def screen_kind(img=None):
     return dict(kind=kind, text=joined, brightness=bright)
 
 
-def cold_start(wait=None, launch=True):
-    """一轮的开始：唤醒解锁 → 没跑就拉起 → 轮询等进村 → 断线框点「重新载入游戏」。
+MAX_POPUPS = 3          # 一轮冷启动最多关 3 个弹窗（关完还有就认输，别死循环）
+MAX_CLICKS = 5          # 一轮冷启动最多点 5 下（含关弹窗、点空地收面板）
 
-    返回 dict(ok, mode, woke, unlocked, launched, pid, waited, via, steps, error)
+
+def _frame_diff(a, b):
+    """两帧差多少（灰度平均绝对差）。判断「点这一下画面到底变没变」。"""
+    if a is None or b is None or a.shape != b.shape:
+        return 999.0
+    try:
+        return float(cv2.absdiff(cv2.cvtColor(a, cv2.COLOR_BGR2GRAY),
+                                 cv2.cvtColor(b, cv2.COLOR_BGR2GRAY)).mean())
+    except Exception:
+        return 999.0
+
+
+def _clicks_str(clicks):
+    return "".join(f"({x},{y})" for x, y in clicks) or "无"
+
+
+def cold_start(wait=None, launch=True, fail_path=None):
+    """一轮的开始：唤醒解锁 → 没跑就拉起 → 轮询等进村 → 关掉挡屏的弹窗/面板。
+
+    返回 dict(ok, mode, woke, unlocked, launched, pid, waited, via, steps, error,
+              taps, last_kind, fail_screen)
 
     为什么不等固定秒数：刚拉起的游戏 18~40s 才进村（看机器忙不忙），死等 25s 要么白等
     要么早读；这里按画面判（村庄锚点 / 资源条读得出来），进村就往下走，最多等
     VILLAGE_WAIT 秒，到点就交回失败——绝不能把一轮拖成无限长。
+
+    挡屏的东西按「能不能认出关闭键」处理（判据全在 coc_patrol2.blocker）：
+      白 ✕ / 红 ✕ / 对话框 ✕ → 点那个 ✕（只点右上角，绝不点「前往查看」「领取」）
+      左侧竖面板           → 点空地收掉（点面板右沿之外的空地，点面板里等于没点）
+      提示气泡             → 点一次空地，还在就不管了（它不挡按钮，只可能压住一个采集点）
+      整屏压暗但认不出 ✕   → 依次试候选角点，点完看画面变没变，变了就停
+    实测（19.100.1）：关掉「欢迎来到公共频道」之后，游戏会自己打开左侧部落信息面板、
+    右下角再弹一个女王提示气泡，所以关完弹窗必须再收一次尾，否则进不了干净村庄。
 
     红线：掉到 QQ/微信 登录页就写 alert 退出，绝不自己登。
     """
     t0 = time.time()
     wait = float(wait or VILLAGE_WAIT)
     out = dict(ok=False, mode=None, woke=False, unlocked=None, launched=False,
-               pid=None, waited=0.0, via=None, steps=[], error=None)
+               pid=None, waited=0.0, via=None, steps=[], error=None,
+               taps=[], last_kind=None, fail_screen=None)
 
     w = wake_unlock()
     out["woke"], out["unlocked"] = w.get("woke"), w.get("unlock")
@@ -554,19 +609,17 @@ def cold_start(wait=None, launch=True):
     # 轮询等进村：画面说了算，最多 VILLAGE_WAIT 秒
     deadline = time.time() + wait
     reloads = 0
+    pops = 0                     # 关掉的弹窗个数
+    clicks = []                  # 点过的坐标（失败时写进 error / fail_screen，方便复盘）
+    shade_idx = 0                # 「压暗但认不出 ✕」时按候选点依次试
+    bubble_tried = False         # 气泡只点一次空地，之后不管它
+    promo_tried = False          # 「压暗 + 推广文案」兜底只试一次
     last_kind = None
+    img = None
     while time.time() < deadline:
-        kind, joined = village_probe()
+        img = grab()
+        kind, joined = village_probe(img)
         last_kind = kind
-        left = deadline - time.time()
-        if kind == "village":
-            time.sleep(0.8)                  # 进村那一两秒数字还在滚动，稳一下
-            kind2, _ = village_probe()
-            if kind2 == "village":
-                out["ok"] = True
-                out["via"] = "village"
-                break
-            continue
         if kind == "login":
             out["error"] = "login_page（掉到登录/授权页，停手等人工处理）"
             out["steps"].append("login")
@@ -583,27 +636,146 @@ def cold_start(wait=None, launch=True):
             deadline = time.time() + wait        # 重载要重新计时（但总时长仍有看门狗）
             time.sleep(6.0)
             continue
-        if kind in ("ad", "popup", "unknown", "panel"):
-            # 推广弹层 / 欢迎回来：dismiss_promo 有「压暗 + 命中推广文案」双判据，安全
+
+        blk = _ocr.blocker(img, ignore=("bubble",) if bubble_tried else ())
+        if blk and blk["kind"] in ("white-x", "red-x", "dialog", "shade"):
+            if pops >= MAX_POPUPS or len(clicks) >= MAX_CLICKS:
+                out["error"] = (f"popup_loop（关了 {pops} 个弹窗还没进村，"
+                                f"最后画面 {last_kind}）")
+                break
+            if blk["kind"] == "shade":
+                # 认不出 ✕：按候选点依次试，点完看画面变没变，变了就从头再判
+                cands = _ocr.close_candidates(img)
+                x, y, why = cands[min(shade_idx, len(cands) - 1)]
+                shade_idx += 1
+                log(f"  画面被压暗（暗区 {blk.get('dark_frac')}），试关弹窗点 {why} @({x},{y})")
+                shell().tap(x, y, wait=1.5)
+                clicks.append([x, y])
+                pops += 1
+                out["steps"].append(f"modal_tap(shade:{why})")
+                after = grab()
+                if _frame_diff(img, after) < 3.0:
+                    log("    画面没变，换下一个候选点")
+                else:
+                    shade_idx = 0
+                continue
+            log(f"  关弹窗（{blk['kind']}）@({blk['x']},{blk['y']})")
+            shell().tap(blk["x"], blk["y"], wait=1.5)
+            clicks.append([blk["x"], blk["y"]])
+            pops += 1
+            out["steps"].append(f"popup_closed({blk['kind']})")
+            # 关完不睡觉，直接回循环头再判一帧：这一步就是在做「二次收尾」
+            continue
+
+        if blk and blk["kind"] == "sidebar":
+            if len(clicks) >= MAX_CLICKS:
+                out["error"] = (f"panel_stuck（左侧面板点了 {len(clicks)} 下还没收掉，"
+                                f"最后画面 {last_kind}）")
+                break
+            log(f"  左侧面板开着（竖边 x={blk.get('edge')}），点空地收掉 @({blk['x']},{blk['y']})")
+            shell().tap(blk["x"], blk["y"], wait=1.2)
+            clicks.append([blk["x"], blk["y"]])
+            out["steps"].append("panel_dismissed")
+            continue
+
+        if blk and blk["kind"] == "bubble":
+            bubble_tried = True
+            if len(clicks) < MAX_CLICKS:
+                log(f"  有个提示气泡，点空地试探 @({blk['x']},{blk['y']})")
+                shell().tap(blk["x"], blk["y"], wait=1.0)
+                clicks.append([blk["x"], blk["y"]])
+                out["steps"].append("bubble_dismissed")
+                continue
+            continue
+
+        if kind == "popup" and any(w in joined for w in _ocr.POPUP_WORDS):
+            # 「欢迎回来」「村庄被袭击」这类：文案对得上才点「确定」
+            # （和 enter_village 同一条红线：绝不盲点确定，兜底只碰右上角的 ✕）
+            if pops >= MAX_POPUPS or len(clicks) >= MAX_CLICKS:
+                out["error"] = (f"popup_loop（关了 {pops} 个弹窗还没进村，"
+                                f"最后画面 {last_kind}）")
+                break
+            b = _ocr.find_btn(_ocr.ocr_all(img), ("确定", "好的", "继续"))
+            if b:
+                log(f"  关欢迎弹窗 {b['t']!r} @({b['x']},{b['y']})")
+                shell().tap(b["x"], b["y"], wait=1.5)
+                clicks.append([b["x"], b["y"]])
+                pops += 1
+                out["steps"].append("popup_closed(welcome)")
+                continue
+
+        # 兜底：认不出形状、又不是村庄，就用「压暗 + 推广文案」那条老路试一次
+        # （全屏活动页背景很亮时 modal_shade 不成立，只有这条能认出来）
+        if kind in ("ad", "popup", "unknown", "panel") and not promo_tried and len(clicks) < MAX_CLICKS:
+            promo_tried = True
             try:
-                dismiss_promo()
+                dim = float(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).mean()) if img is not None else 255.0
             except Exception:
+                dim = 255.0
+            if dim >= 95:
+                # dismiss_promo 只在「压暗 + 推广文案」同时成立时才点；画面不暗就不会点，
+                # 那就别把这一步记进 steps（否则日志里会多一条没发生过的动作）
                 pass
-        if left < 4:
+            else:
+                try:
+                    after = dismiss_promo(img)
+                except Exception:
+                    after = None
+                if after is not None and _frame_diff(img, after) > 3.0:
+                    out["steps"].append("popup_closed(promo)")
+                    log("  关掉全屏弹层（压暗 + 推广文案），画面已变")
+                    continue
+
+        if kind == "village":
+            time.sleep(0.8)                  # 进村那一两秒数字还在滚动，稳一下
+            img2 = grab()
+            kind2, _ = village_probe(img2)
+            blk2 = _ocr.blocker(img2, ignore=("bubble",) if bubble_tried else ())
+            if kind2 == "village" and blk2 is None:
+                out["ok"] = True
+                out["via"] = "village"
+                out["steps"].append("village")
+                img = img2
+                break
+            img = img2
+            continue
+
+        if time.time() >= deadline - 4:
             break
         time.sleep(2.0)
 
+    out["taps"] = clicks
+    out["last_kind"] = last_kind
     if not out["ok"] and not out["error"]:
-        out["error"] = f"village_timeout（{wait:.0f}s 内没进村，最后画面 {last_kind}）"
+        out["error"] = (f"village_timeout（{wait:.0f}s 内没进村，最后画面 {last_kind}，"
+                        f"点过 {_clicks_str(clicks)}）")
+    if not out["ok"]:
+        # 留证据：失败这一帧存下来，下次出问题能对着图复盘（以前只有 meta.json，
+        # 一张图都没有，只能靠猜）
+        out["fail_screen"] = dict(kind=last_kind, taps=[list(c) for c in clicks],
+                                  steps=list(out["steps"]))
+        if fail_path:
+            try:
+                if img is not None:
+                    os.makedirs(os.path.dirname(fail_path) or ".", exist_ok=True)
+                    cv2.imwrite(fail_path, img)
+                    out["fail_screen"]["path"] = os.path.basename(fail_path)
+                    out["fail_screen"]["bright"] = round(
+                        float(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).mean()), 1)
+            except Exception as e:
+                out["fail_screen"]["error"] = f"{type(e).__name__}: {e}"
     out["waited"] = round(time.time() - t0, 1)
     log(f"  冷启动 {'成功' if out['ok'] else '失败'} {out['waited']}s via={out['via']} "
-        f"err={out['error']}")
+        f"steps={'/'.join(out['steps'])} err={out['error']}")
     return out
 
 
-def start_round(cold=True, wait=None):
-    """一轮开头的统一入口（取代老的 ensure_ready + enter_village 两步）。"""
-    out = cold_start(wait=wait, launch=True)
+def start_round(cold=True, wait=None, fail_path=None):
+    """一轮开头的统一入口（取代老的 ensure_ready + enter_village 两步）。
+
+    fail_path：进村失败时把最后一帧存到这里（调用方给 history/<id>/fail.jpg）。
+    """
+    out = cold_start(wait=wait, launch=True, fail_path=fail_path)
     if not out["ok"] and out.get("mode") == "cold" and not cold:
         out["error"] = out["error"] or "game_not_running"
     if out["ok"] and out.get("mode") == "cold":

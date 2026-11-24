@@ -739,11 +739,15 @@ class MemAuto:
         if run_dir:
             os.makedirs(run_dir, exist_ok=True)
 
-        # 1) 一轮开始：冷启动（唤醒 + 解锁 → 没跑就拉起 → 轮询等进村 → 断线框点重新载入）
+        # 1) 一轮开始：冷启动（唤醒 + 解锁 → 没跑就拉起 → 轮询等进村 → 关掉挡屏弹窗/面板）
         cs = None
         try:
-            cs = mem.start_round(cold=bool(self.opt("cold_start", True)),
-                                 wait=self.opt("village_wait_s"))
+            cs = mem.start_round(
+                cold=bool(self.opt("cold_start", True)),
+                wait=self.opt("village_wait_s"),
+                # 进村失败时把最后一帧落到 history/<id>/fail.jpg：以前失败轮只有 meta.json，
+                # 一张图都没有，事后只能靠猜（那是哪一屏、弹窗长什么样全不知道）
+                fail_path=os.path.join(run_dir, "fail.jpg") if run_dir else None)
         except Exception as e:
             rec["status"] = "failed"
             rec["error"] = f"冷启动异常: {type(e).__name__}: {e}"
@@ -755,9 +759,13 @@ class MemAuto:
             err = cs.get("error") or "unknown"
             rec["status"] = "failed"
             rec["error"] = f"冷启动失败: {err}"
+            # 失败时留证据：最后识别到的画面类型 + 点过的坐标（都在 cs 里，coc_patrol_run
+            # 会把 cold_start 整块写进 meta；这里再提一份 fail_screen 方便直接看）
+            if cs.get("fail_screen"):
+                rec["fail_screen"] = cs["fail_screen"]
             # 掉登录页是红线：不尝试自己登，只写 alert 退出
             alerts.append("login_page" if "login" in err else "cold_start_failed")
-            log(f"  ⚠ {rec['error']}")
+            self.log(f"  ⚠ {rec['error']}")
             rec["duration"] = rec["dur_s"] = round(time.time() - t0, 1)
             return rec
 
