@@ -517,8 +517,8 @@ def screen_kind(img=None):
     return dict(kind=kind, text=joined, brightness=bright)
 
 
-MAX_POPUPS = 3          # 一轮冷启动最多关 3 个弹窗（关完还有就认输，别死循环）
-MAX_CLICKS = 5          # 一轮冷启动最多点 5 下（含关弹窗、点空地收面板）
+MAX_POPUPS = 6          # 一轮冷启动最多关 6 个弹窗（关完还有就认输，别死循环）
+MAX_CLICKS = 8          # 一轮冷启动最多点 8 下（含关弹窗、点空地收面板）
 
 
 def _frame_diff(a, b):
@@ -897,13 +897,22 @@ def load_collectors():
 
 # ---------------------------------------------------------------- 读数
 def sane(a):
+    """读数像不像一个真实资源结构（按 TH15 的仓库上限给一倍余量）。
+
+    以前四个字段全放到 2 亿，等于不设防：实测一个假地址读出 gems=17,664（实际 349）、
+    dark=8,750,336（暗黑上限 30 万，差 30 倍），因为 sane 放它过去，整轮升级点位全乱、
+    研究 8 次全失败（2026-11-25 01:53 那轮，地址 0x6f00e5c128）。
+    暗黑是最硬的判据：它上限最低、正常值最小，假结构基本过不了。
+    """
     if not a:
         return False
-    if not all(0 <= a[k] <= 200_000_000 for k in ("gems", "gold", "elixir", "dark")):
+    if not all(0 <= a[k] <= 30_000_000 for k in ("gems", "gold", "elixir")):
+        return False
+    if not 0 <= a["dark"] <= 600_000:
         return False
     if a["gold"] == 0 and a["elixir"] == 0:
         return False
-    if a["gems"] > 5_000_000:
+    if a["gems"] > 100_000:
         return False
     return True
 
@@ -1260,8 +1269,8 @@ def _seed_sane(seed):
             return False
     if g < 1_000:                        # 这个号的金币是七位数，小于 1000 只能是垃圾
         return False
-    if e > 200_000_000 or k > 20_000_000:
-        return False
+    if e > 30_000_000 or k > 600_000:
+        return False                 # 暗黑上限按 TH15 的 30 万给一倍余量
     if e and k and abs(e - k) <= max(2_000, int(e * 0.01)):
         return False                     # 圣水和暗黑几乎相等：典型垃圾结构
     return True
@@ -1291,27 +1300,49 @@ def _confirm(pid, addr, tries=2, gap=1.2):
 
 
 def _seed_spec(hud, sample):
-    """拼出搜索窗口：画面读到的用 0.1%，只有上一轮存下的用 2%，都没有就不约束。"""
+    """拼出搜索窗口：画面读到的用 0.5%，只有上一轮存下的用 2%，都没有就不约束。
+
+    暗黑那项额外放宽：它只有五六位，OCR 会整位读错（实测真值 77,396 读成 177,396，
+    差整整 100,000），而 gold/elixir 都是七位数、认得准。暗黑一旦被读错，exact3 和
+    near 全部落空，整轮 300s 定位烧完还失败（2026-11-25 01:47 那轮就是这样挂的）。
+    所以它跟上一轮差得离谱时干脆不拿来当锚，位置只靠 gold+elixir 定。
+    """
     spec = []
     for i in range(3):
+        ref, tol = (None, None)
         if hud and hud[i]:
-            spec.append((hud[i], 0.005))
+            ref, tol = hud[i], 0.005
         elif sample and sample[i]:
-            spec.append((sample[i], 0.02))
-        else:
-            spec.append((None, None))
+            ref, tol = sample[i], 0.02
+        if i == 2 and ref and sample and sample[i]:
+            if abs(ref - sample[i]) > max(5000, int(sample[i] * 0.25)):
+                ref, tol = None, None
+        spec.append((ref, tol))
     return spec
 
 
 def _hud_agree(v, spec, min_keys=2):
-    """候选值必须和参考读数对得上：对得上的项 >= min_keys，且没有一项超窗。"""
-    hit = 0
+    """候选值必须和参考读数对得上：对得上的项 >= min_keys。
+
+    gold / elixir 是七位数，OCR 认得准，超窗就一票否决；
+    dark 只有五六位、会整位读错，超窗只算「没对上」，不否决——否则 g/e 两项全中
+    也会被一个读错的暗黑判死，整轮定位空转 300s（2026-11-25 01:47 实录）。
+    """
+    hit, strong, strong_ref = 0, 0, 0
     for k, (ref, tol) in zip(("gold", "elixir", "dark"), spec):
         if not ref:
             continue
+        if k in ("gold", "elixir"):
+            strong_ref += 1
         if abs(v[k] - ref) > max(2000, int(ref * tol)):
-            return False
+            if k in ("gold", "elixir"):
+                return False
+            continue
         hit += 1
+        if k in ("gold", "elixir"):
+            strong += 1
+    if strong_ref and strong < strong_ref:
+        return False             # gold/elixir 有一个参考值就必须全中，不能拿暗黑凑数
     return hit >= min_keys
 
 
@@ -1377,6 +1408,8 @@ def _scan(pid, specs, spec_check, min_mb=4, deadline=None):
                 v = _verify(pid, addr)
                 if not v:
                     continue
+                if not sane(v):
+                    continue        # gems/dark 不像真资源：假地址，直接丢
                 sc, ok, hit = 0, False, None
                 for chk in checks:
                     s1 = _score(v, chk)

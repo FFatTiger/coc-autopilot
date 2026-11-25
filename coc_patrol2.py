@@ -392,8 +392,10 @@ def _cross_inside(box):
     inner = g[int(h * 0.16):int(h * 0.84), int(w * 0.16):int(w * 0.84)].astype(np.uint8)
     if inner.size < 100:
         return None
-    th, _ = cv2.threshold(inner, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    dark = inner < th
+    th, res = cv2.threshold(inner, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # 用「Otsu 判成暗的那一类」而不是 `inner < th`：两类像素亮度接近时 th 会正好落在暗类的值上，
+    # `< th` 一个都取不到，判据永远不成立（实测手画的 ✕ 灰度 33、Otsu 阈值也是 33）
+    dark = res == 0
     frac = float(dark.mean())
     if not (0.04 <= frac <= 0.45):
         return None
@@ -449,6 +451,55 @@ def popup_x_red(im, region=None, min_area=1500):
     return dict(kind="red-x", x=best[1], y=best[2], box=None, score=best[0]) if best else None
 
 
+def dialog_ok_button(im, box=None):
+    """对话框里的绿色主按钮（「确定」「继续」）→ dict(x, y, box, score) 或 None
+
+    「首领，欢迎回来！」这类回归弹窗（村庄被袭击 / 完成的升级 / 联赛结算）**没有 ✕**，
+    唯一出口是卡片底部那颗亮绿圆角按钮。旧逻辑找不到红 ✕ 就退回卡片右上角，点上去
+    等于点在边框上，冷启动于是原地打转：关 3 次画面没变 → popup_loop → 整轮作废
+    （2026-11-24 连着挂 4 轮，全是这个弹窗，见 history/20261124_190001/fail.jpg、
+    20261124_230001/fail.jpg）。
+
+    判据只在卡片内部找，不绑坐标：
+      ① HSV 绿 H 32~88、S ≥ 105、V ≥ 135
+      ② 连通域宽 110~360、高 40~100、宽高比 1.8~5.5（COC 主按钮是横放胶囊）
+      ③ 填充率 ≥ 0.70（圆角矩形实心；草地、装饰、宝石图标过不了）
+      ④ 只搜卡片竖直 45%~100% 那一段（按钮压底，不压顶）
+    """
+    if im is None or im.shape[0] < 300:
+        return None
+    H, W = im.shape[:2]
+    if box:
+        bx, by, bw, bh = [int(v) for v in box]
+    else:
+        bx, by, bw, bh = int(W * 0.15), int(H * 0.15), int(W * 0.70), int(H * 0.70)
+    x0, x1 = max(0, bx), min(W, bx + bw)
+    y0, y1 = max(0, by + int(bh * 0.45)), min(H, by + bh)
+    if x1 - x0 < 80 or y1 - y0 < 40:
+        return None
+    sub = im[y0:y1, x0:x1]
+    hsv = cv2.cvtColor(sub, cv2.COLOR_BGR2HSV)
+    h, s, v = (hsv[:, :, i].astype(int) for i in range(3))
+    m = ((h >= 32) & (h <= 88) & (s >= 105) & (v >= 135)).astype(np.uint8)
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    n, lab, stats, cent = cv2.connectedComponentsWithStats(m, 8)
+    best = None
+    for k in range(1, n):
+        x, y, w, hh, area = stats[k]
+        if not (110 <= w <= 360 and 40 <= hh <= 100):
+            continue
+        if not (1.8 <= w / float(max(1, hh)) <= 5.5):
+            continue
+        if area / float(w * hh) < 0.70:
+            continue
+        if best is None or area > best[0]:
+            best = (int(area), int(x0 + x + w // 2), int(y0 + y + hh // 2),
+                    [int(x0 + x), int(y0 + y), int(w), int(hh)])
+    if not best:
+        return None
+    return dict(x=best[1], y=best[2], box=best[3], score=best[0])
+
+
 def centered_dialog(im):
     """屏幕中央的大浅色卡片（「恭喜获得 宝箱×3」这类对话框）→ dict 或 None
 
@@ -488,9 +539,19 @@ def centered_dialog(im):
     # 标题栏那一条：卡片上沿往上一截（✕ 压在标题栏里，可能整个在卡片外面）
     band = (bx - 12, by - int(bh * 0.22), bx + bw + 12, by + int(bh * 0.18))
     rx = popup_x_red(im, region=band, min_area=900)
-    px, py = (rx["x"], rx["y"]) if rx else (bx + bw - int(bw * 0.055), by - int(bh * 0.06))
+    if rx:
+        return dict(kind="dialog", box=[bx, by, bw, bh], x=int(rx["x"]), y=int(rx["y"]),
+                    how="red-x")
+    # 没 ✕ 才轮到底部绿按钮：「首领，欢迎回来！」这类回归弹窗只有「确定」。
+    # 顺序不能反——「恭喜获得」那种弹窗既有红 ✕ 又有绿「领取」，领宝箱会开箱、
+    # 可能再弹一层，永远优先点 ✕。
+    ok = dialog_ok_button(im, (bx, by, bw, bh))
+    if ok:
+        return dict(kind="dialog", box=[bx, by, bw, bh], x=int(ok["x"]), y=int(ok["y"]),
+                    how="green-ok")
+    px, py = bx + bw - int(bw * 0.055), by - int(bh * 0.06)
     return dict(kind="dialog", box=[bx, by, bw, bh], x=int(px), y=int(py),
-                how="red-x" if rx else "corner")
+                how="corner")
 
 
 def popup_x_light(im):
