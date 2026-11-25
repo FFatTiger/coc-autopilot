@@ -127,11 +127,8 @@
 "Gold Storage|13": {
 "currency": "elixir",
 "cost": 2800000,
-"source": "panel_probe",
-"at": "2026-11-21T16:53:55-05:00",
-"verified_level": 13,
-"shot": "work/probe_Gold_Storage.png",
-"note": "面板价 + 圣水图标（旧记录误记 gold）"
+"source": "panel_prod",
+"at": "2026-11-24 09:03:12"
 },
 "Laboratory|10": {
 "currency": "elixir",
@@ -233,5 +230,11 @@
 "cost": 2100000,
 "source": "upgrade_delta",
 "at": "2026-11-23 21:07:58"
+},
+"Dark Elixir Drill|4": {
+"currency": "elixir",
+"cost": 1200000,
+"source": "upgrade_delta",
+"at": "2026-11-25 02:07:16"
 }
 }
