@@ -453,6 +453,11 @@ def _village_ok(tx):
     冷启动眼睁睁等满 120s 判失败，而画面明明就是干净村庄（fail.jpg 为证）。
     这里把右上角资源区那几段数字**按位置拼起来再数位数**，其余判据（底栏「建造/战斗」）
     和 classify 完全一致。
+
+    资源区取 y<250（金币/圣水/暗黑是三行，y≈57/131/205）：原先只看到 y<100 那一行
+    金币的数字，而金币那行恰好是活动高光/描边最花的一行，OCR 会认成 'SES 6E0' 这种乱码
+    （实测 11-26 15:49 那轮，圣水那行明明读出了 7 位 '9889659' 在第 131 行，却没被看到），
+    结果就是人在村里、底栏两字都在，还硬等超时。
     """
     if not tx:
         return False
@@ -461,7 +466,7 @@ def _village_ok(tx):
         return False
     digits = 0
     for t in tx:
-        if t["y"] < 100 and 1700 <= t["x"] <= 2220:
+        if t["y"] < 250 and 1600 <= t["x"] <= 2220:
             digits += len("".join(c for c in t["t"] if c.isdigit()))
     return digits >= 5
 
