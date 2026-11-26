@@ -1322,6 +1322,13 @@ def _seed_spec(hud, sample):
         if i == 2 and ref and sample and sample[i]:
             if abs(ref - sample[i]) > max(5000, int(sample[i] * 0.25)):
                 ref, tol = None, None
+        # 金币/圣水是七位数、平时认得准，但也会整位多读一个 1：实测 11-26 15:58 那轮，
+        # 真值 elixir 6,396,886 被读成 16,396,886，而 _hud_agree 对 gold/elixir 是
+        # 「有参考就必须全中」的死条件——一个错锚把所有正确候选全否决，重定位白烧 300s。
+        # 仓库容量就那么点，一轮不可能涨过 50%（再加 2M 绝对兜底），超了就是 OCR 读错。
+        if i in (0, 1) and ref and sample and sample[i]:
+            if abs(ref - sample[i]) > max(2000000, int(sample[i] * 0.5)):
+                ref, tol = None, None
         spec.append((ref, tol))
     return spec
 
@@ -1680,6 +1687,26 @@ def refine(det, pairs, T, tol=16.0):
                                        np.float32(Q).reshape(-1, 1, 2), method=cv2.LMEDS)
     if M is None:
         return None
+    # 第二轮起剔除残差大的点重拟合。为什么要这么做：气泡是按颜色分的（金/圣水/暗黑），
+    # 而村庄里同时存在的「升级」「军队升级」「宝箱」这些气泡颜色也在同一色系，会被当成
+    # 采集器气泡，再匹配到 pairs 里某个真实采集点上（它们不一定离得远），几颗脏点就能把
+    # 相似变换拉偏几十到上百像素——表现就是升级阶段点什么都没命中，点到城墙/树上。
+    Pv, Qv = np.float32(P), np.float32(Q)
+    for _ in range(2):
+        pred = cv2.transform(Pv.reshape(-1, 1, 2), M).reshape(-1, 2)
+        r = np.abs(pred - Qv).max(axis=1)
+        keep = r <= max(4.0, tol * 0.5)
+        if keep.sum() < 3 or bool(keep.all()):
+            break
+        M2, _ = cv2.estimateAffinePartial2D(Pv[keep].reshape(-1, 1, 2),
+                                           Qv[keep].reshape(-1, 1, 2), method=cv2.LMEDS)
+        if M2 is None:
+            break
+        M = M2
+        P, Q = [p for p, k in zip(P, keep) if k], [q for q, k in zip(Q, keep) if k]
+        Pv, Qv = np.float32(P), np.float32(Q)
+        if len(P) < 3:
+            break
     s = float(np.hypot(M[0, 0], M[1, 0]))
     if not 0.6 <= s <= 2.6:
         return None
@@ -1718,7 +1745,7 @@ def calibrate_anchors(img, s_hint=None):
             H, W = tp.shape[:2]
             r = cv2.matchTemplate(img, tp, cv2.TM_CCOEFF_NORMED)
             _, mx, _, ml = cv2.minMaxLoc(r)
-            if mx >= 0.80:
+            if mx >= 0.72:            # 0.80 太严：活动装饰（南瓜/彩灯）盖到锚点边角就再也匹配不上
                 ax, ay = ml[0] + W / 2.0, ml[1] + H / 2.0
                 tx, ty = ax - s * Ac[0], ay - s * Ac[1]
                 tot, n = mx, 1
@@ -1731,12 +1758,16 @@ def calibrate_anchors(img, s_hint=None):
                     y0 = int(py - Hb / 2 - R)
                     if (x0 < 0 or y0 < 0 or x0 + Wb + 2 * R > img.shape[1]
                             or y0 + Hb + 2 * R > img.shape[0]):
-                        break
+                        continue          # 这个锚点跑到画面外了，不是「全部锚点必须都在」
                     win = img[y0:y0 + Hb + 2 * R, x0:x0 + Wb + 2 * R]
                     rb = cv2.matchTemplate(win, tpb, cv2.TM_CCOEFF_NORMED)
-                    tot += float(rb.max())
+                    mxb = float(rb.max())
+                    if mxb < 0.55:        # 交叉验证也要有门槛，否则凑出来的定位看不出错
+                        n = -1
+                        break
+                    tot += mxb
                     n += 1
-                if n == len(anchors):
+                if n >= max(2, len(anchors) - 1):
                     sc = tot / n
                     if out is None or sc > out[0]:
                         out = (sc, s, tx, ty)
