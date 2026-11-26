@@ -417,8 +417,10 @@ class MemAuto:
         except Exception as e:
             self.log(f"  [targets] 枚举失败: {type(e).__name__}: {e}")
             return []
-        up = self.ast.get("mem_upgrades", {})
-        bad_tap = set(self.ast.get("mem_bad_tap") or [])
+        up = {}
+        for k, v in (self.ast.get("mem_upgrades") or {}).items():
+            up.setdefault(self._inst_of_key(k), v)      # 只按实例比，不认等级
+        bad_tap = {self._inst_of_key(k) for k in (self.ast.get("mem_bad_tap") or [])}
         now = time.time()
         cd = float(self.opt("mem_cooldown_h", 24) or 24) * 3600
         out = []
@@ -427,10 +429,11 @@ class MemAuto:
             if t["currency"] not in prio:
                 continue
             key = "%s|%d|%.1f,%.1f" % (t["name"], t["level"], t["x"], t["y"])
-            last = up.get(key)
+            inst = self._inst_of_key(key)
+            last = up.get(inst)
             if last and now - last.get("ts", 0) < last.get("cd", cd):
                 continue
-            if key in bad_tap:
+            if inst in bad_tap:
                 continue                     # 这个实例的点位就是点不中，别再浪费点击
             sx, sy = t["screen"]
             if not (8 <= sx <= 2212 and 8 <= sy <= 1072):
@@ -450,7 +453,7 @@ class MemAuto:
         # 每轮最多试「候选数」和「空闲工人数」里小的那个；
         # 一个工人都没空就一个面板都不用开（不开面板 = 不浪费点击 = 不发热）
         cap = min(len(out), bs["idle"])
-        max_targets = int(self.opt("max_targets", 3) or 0)
+        max_targets = int(self.opt("max_targets", 5) or 0)
         if max_targets:
             cap = min(cap, max_targets)
         self.n_plan = max(0, cap)
@@ -469,16 +472,28 @@ class MemAuto:
             name.replace(" ", "_")))
         return self.shot(base + ".jpg")
 
+    @staticmethod
+    def _inst_of_key(key):
+        """'Gold Storage|12|54.0,78.0' → 'Gold Storage|54.0,78.0'
+
+        为什么去掉等级：建筑一开工，内存里读到的等级就是「升完的等级」（12→13 时读成 13），
+        同一个实例前后 key 就差一位，冷却和黑名单全对不上，升级中的建筑会被当成新候选
+        反复点（点了只会「认不到确认页」，白烧一次点击和十几秒）。
+        """
+        p = str(key).split("|")
+        return "%s|%s" % (p[0], p[2]) if len(p) == 3 else str(key)
+
     def _note_fail(self, t, why):
         fails = self.ast.setdefault("mem_fails", {})
-        k = t["_key"]
+        k = self._inst_of_key(t["_key"])
         fails[k] = fails.get(k, 0) + 1
         self.ast.setdefault("upgrade_fails", []).append(
             dict(target=t["name"], ok=False, why=why, at=iso_now()))
         self.ast["upgrade_fails"] = self.ast["upgrade_fails"][-20:]
         if fails[k] >= 2 and why in ("no_price", "no_charge"):
             bldlib.note_blocked(t["_type"], t["_level"], reason=why)
-        if fails[k] >= 2 and (why.startswith("wrong_building") or why == "no_panel"):
+        if fails[k] >= 2 and (why.startswith("wrong_building")
+                              or why in ("no_panel", "no_confirm_page")):
             # 点位问题：只封这一个实例，别把整个类型封掉
             lst = self.ast.setdefault("mem_bad_tap", [])
             if k not in lst:
@@ -504,7 +519,7 @@ class MemAuto:
         idle_cap = self.n_plan or 0
         caps = self.caps()
         kinds = self.kinds()
-        max_targets = int(self.opt("max_targets", 3) or 0)
+        max_targets = int(self.opt("max_targets", 5) or 0)
         for t in tg:
             if max_targets and tried >= max_targets:
                 break
@@ -587,8 +602,11 @@ class MemAuto:
                 self._note_fail(t, "no_confirm_page")
                 self.log(f"  [upgrade] {t['name']} 放弃：没认到确认页（可能工人不足/资源不足）")
                 attempts.append(dict(target=t["name"], ok=False, why="no_confirm_page"))
-                return dict(target=t["name"], ok=False, why="no_confirm_page",
-                            attempts=attempts, panel_jpg=p, confirm_jpg=p2), res
+                rec = dict(target=t["name"], ok=False, why="no_confirm_page",
+                           attempts=attempts, panel_jpg=p, confirm_jpg=p2)
+                # 这一栋认不到确认页（多半是在升级中、或者点到了旁边的建筑）不该让整轮收工，
+                # 后面还有候选；同一实例连着两次认不到就进 mem_bad_tap 拉黑。
+                continue
             before = self.read(retries=1) or res
             mem.shell().tap(*cf["btn"], wait=1.9)          # 点「确认」= 真正扣费
             after = self.read(retries=2) or before

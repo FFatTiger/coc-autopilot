@@ -128,7 +128,7 @@
 "currency": "elixir",
 "cost": 2800000,
 "source": "panel_prod",
-"at": "2026-11-24 09:03:12"
+"at": "2026-11-25 23:03:06"
 },
 "Laboratory|10": {
 "currency": "elixir",
@@ -236,5 +236,11 @@
 "cost": 1200000,
 "source": "upgrade_delta",
 "at": "2026-11-25 02:07:16"
+},
+"Gold Storage|12": {
+"currency": "elixir",
+"cost": 1800000,
+"source": "upgrade_delta",
+"at": "2026-11-25 09:04:47"
 }
 }
