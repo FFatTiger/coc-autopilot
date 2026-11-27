@@ -100,7 +100,13 @@ if not hasattr(_ocr, "_mc_fail"):
 STATE = os.path.join(HERE, "coc_state.json")          # 资源地址 + 最近一次读数（定位种子）
 COLLECTORS = os.path.join(HERE, "collectors_mem.json")  # 17 个采集点 + dismiss（标定视角）
 CALIB = os.path.join(HERE, "mem_calib.json")          # 当前镜头变换缓存
+CALIB_TRUSTED = os.path.join(HERE, "mem_calib_trusted.json")  # 最近一次「可信」位姿（只记可信的）
 ANCHORS = os.path.join(HERE, "coc_templates", "village_anchors.npz")  # 村庄锚点图（定缩放）
+
+TRUST_MIN_MATCHES = 5     # 锚点/气泡交叉验证命中这么多个才算「可信」
+NEAR_MAX_PX = 40.0        # 「近似可信」：与上次可信位姿的平移差上限（像素）
+NEAR_MAX_DS = 0.02        # 「近似可信」：与上次可信位姿的缩放差上限
+NEAR_MAX_AGE_S = 7200     # 可信位姿有效期：超过 2 小时就重新找，别让偏差一路累加
 
 MARK = "__COC_MEM__"
 PAGE = 4096
@@ -893,6 +899,22 @@ def save_calib(t):
     with open(tmp, "w") as f:
         json.dump(t, f, indent=1)
     os.replace(tmp, CALIB)
+
+
+def load_trusted():
+    """最近一次可信位姿（只在判为可信时写，不会被低命中的结果污染）。"""
+    try:
+        with open(CALIB_TRUSTED) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def save_trusted(t):
+    tmp = CALIB_TRUSTED + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(t, f, indent=1)
+    os.replace(tmp, CALIB_TRUSTED)
 
 
 def load_collectors():
@@ -1842,6 +1864,27 @@ def calibrate(img=None):
         else:
             T = dict(s=1.0, tx=0.0, ty=0.0, matches=0, via="identity")
     T["at"] = int(time.time())
+    # 可信度判定集中在这里出：调用方（研究）只看 T["trusted"]，不再自己各判各的。
+    # 为什么多一档「近似可信」：一轮里升级完，游戏会把镜头推到刚开工那栋楼上，锚点贴图被
+    # 进度条/气泡挡住大半，只剩 3 个能交叉验证 → 老规则直接判不可信，研究那一步就整步放弃
+    # （实测连续 10 轮跳过，实验室空转了四天）。而这种推镜头的位移实测只有十来像素，
+    # 只要和上次可信位姿差得少，拿它点实验室是安全的——点错了 open_lab_panel 还会用
+    # 面板标题等级再验一次，不会一路错下去。
+    trust = (T.get("via") in ("anchors", "anchors+bubbles", "bubbles")
+             and int(T.get("matches") or 0) >= TRUST_MIN_MATCHES)
+    if not trust and int(T.get("matches") or 0) >= 3 and str(T.get("via") or "").startswith("anchors"):
+        lt = load_trusted()
+        if (lt and 0.6 <= float(lt.get("s") or 0) <= 2.6
+                and time.time() - int(lt.get("at") or 0) <= NEAR_MAX_AGE_S
+                and abs(T["s"] - lt["s"]) <= NEAR_MAX_DS
+                and abs(T["tx"] - lt["tx"]) <= NEAR_MAX_PX
+                and abs(T["ty"] - lt["ty"]) <= NEAR_MAX_PX):
+            T["via"] = "anchors+near"     # 近似可信：锚点命中少，但与上次可信位姿一致
+            T["near_of"] = int(lt.get("at") or 0)
+            trust = True
+    T["trusted"] = bool(trust)
+    if trust:
+        save_trusted(dict(T))
     save_calib(T)
     log(f"镜头 {T['via']} s={T['s']:.4f} tx={T['tx']:.1f} ty={T['ty']:.1f} "
         f"匹配={T.get('matches', 0)} 气泡={T.get('bubbles', 0)}")

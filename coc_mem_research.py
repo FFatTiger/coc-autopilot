@@ -590,6 +590,10 @@ class Research:
         dx, dy = bldlib.tap_off_of("Laboratory", bldlib.load_offsets())
         trust = ((T or {}).get("via") in ("anchors", "anchors+bubbles", "bubbles")
                  and (T or {}).get("matches", 0) >= 5 and not force)
+        # 标定自己给的 trusted 优先（含「锚点命中少但和上次可信位姿一致」那一档）；
+        # 老的 calib 缓存里没有这个字段，退回上面的旧判据。
+        if (T or {}).get("trusted") is not None:
+            trust = bool(T.get("trusted")) and not force
         if trust:
             sx, sy = self.bld.screen(r["x"], r["y"], T)
             if 30 <= sx <= 2190 and 150 <= sy <= 950:
