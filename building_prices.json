@@ -8,16 +8,8 @@
 "Cannon|14": {
 "currency": "gold",
 "cost": 1200000,
-"source": "panel_probe",
-"at": "2026-11-21T15:51:30-05:00",
-"verified_level": 14,
-"tap_dy": 28,
-"shot": "work/panel_Cannon_L14_price.png",
-"up_btn": [
-1108,
-828
-],
-"note": "原始全幅截图被后续 L13 探测覆盖，价格裁图保留"
+"source": "upgrade_delta",
+"at": "2026-11-27 09:03:37"
 },
 "Archer Tower|17": {
 "currency": "gold",
@@ -128,7 +120,7 @@
 "currency": "elixir",
 "cost": 2800000,
 "source": "panel_prod",
-"at": "2026-11-26 03:15:44"
+"at": "2026-11-27 09:02:59"
 },
 "Laboratory|10": {
 "currency": "elixir",
@@ -242,5 +234,23 @@
 "cost": 1800000,
 "source": "upgrade_delta",
 "at": "2026-11-25 09:04:47"
+},
+"Gold Mine|13": {
+"currency": "elixir",
+"cost": 800000,
+"source": "upgrade_delta",
+"at": "2026-11-27 09:03:21"
+},
+"Dark Elixir Drill|7": {
+"currency": "elixir",
+"cost": 2400000,
+"source": "upgrade_delta",
+"at": "2026-11-26 09:04:36"
+},
+"Gold Mine|15": {
+"currency": "elixir",
+"cost": 2000000,
+"source": "panel_prod",
+"at": "2026-11-26 09:04:42"
 }
 }

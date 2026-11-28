@@ -37,6 +37,38 @@ import coc_mem_panel as panel
 
 STATE = os.path.join(HERE, "coc_auto_state.json")   # 施工跟踪 / 冷却 / 失败计数
 LOGD = os.path.join(HERE, "logs")                   # 证据图（面板 / 确认页 / 扣费后）
+LOGIN_STALE = os.path.join(HERE, "coc_login_stale.json")   # 掉登录页后留的标记（登录只能用户本人做）
+
+
+def _login_stale():
+    """上次掉登录页还留着的标记。
+
+    为什么要它：登录态一失效，QQ/微信登录只能用户本人点，程序无论重试多少次都进不去。
+    没有这个标记时，cron 每轮会白白拉起游戏、等 15 秒、再失败、再关掉——白烧电、白报警。
+    超过 24 小时就自动失效（用户可能已经重登过，只是没跑过成功轮），让它自己重试一次。
+    """
+    try:
+        d = json.load(open(LOGIN_STALE))
+        ts = int(d.get("ts") or 0)
+    except Exception:
+        return None
+    if not ts or time.time() - ts > 24 * 3600:
+        return None
+    return d
+
+
+def _set_login_stale(on, note=""):
+    if on:
+        try:
+            json.dump(dict(ts=int(time.time()), at=iso_now(), note=note),
+                      open(LOGIN_STALE, "w"), ensure_ascii=False)
+        except Exception:
+            pass
+    else:
+        try:
+            os.remove(LOGIN_STALE)
+        except Exception:
+            pass
 
 DIM_TH = 70.0          # 画面平均亮度低于这个 = 有模态框
 RECONNECT = [1105, 926]  # 「重新载入游戏」（UI 固定坐标，不随镜头变）
@@ -757,6 +789,15 @@ class MemAuto:
         if run_dir:
             os.makedirs(run_dir, exist_ok=True)
 
+        # 0) 上次掉过登录页且还没重登：直接跳过，不拉游戏（登录只能用户本人做）
+        st = _login_stale()
+        if st and not dry:
+            rec["status"] = "skipped_login"
+            rec["error"] = "登录态失效，等用户本人重登（%s 那轮掉到登录页）" % st.get("at")
+            rec["duration"] = rec["dur_s"] = round(time.time() - t0, 1)
+            self.log(f"  ⚠ 上次（{st.get('at')}）掉到登录页还没重登，这一轮跳过")
+            return rec
+
         # 1) 一轮开始：冷启动（唤醒 + 解锁 → 没跑就拉起 → 轮询等进村 → 关掉挡屏弹窗/面板）
         cs = None
         try:
@@ -783,9 +824,12 @@ class MemAuto:
                 rec["fail_screen"] = cs["fail_screen"]
             # 掉登录页是红线：不尝试自己登，只写 alert 退出
             alerts.append("login_page" if "login" in err else "cold_start_failed")
+            if "login" in err:
+                _set_login_stale(True, note=err)
             self.log(f"  ⚠ {rec['error']}")
             rec["duration"] = rec["dur_s"] = round(time.time() - t0, 1)
             return rec
+        _set_login_stale(False)         # 进村了 = 登录态正常，把标记清掉
 
         # 2) 抓一帧：画面偏暗先当模态框处理
         img = mem.grab()

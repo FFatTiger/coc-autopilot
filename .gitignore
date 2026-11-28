@@ -34,3 +34,4 @@ building_types.json
 building_blocked.json
 # 运行时状态：镜头可信位姿缓存（每轮都会写）
 mem_calib_trusted.json
+coc_login_stale.json
